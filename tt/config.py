@@ -28,13 +28,20 @@ class Config:
     silero_on: float = 0.5
 
     # ---- background-speech rejection ----
-    bg_below_caller_db: float = 12.0     # runs this far below the caller's own level are ignored
+    bg_below_caller_db: float = 99.0     # per-frame gate (off: the run-level soft_rel_db check does this); frames this far below the caller's own level are ignored
+    caller_ref_pct: float = 80.0         # caller level = this percentile of their speech frames
 
     # ---- run / decision logic ----
-    hangover_ms: float = 140.0           # gap that still counts as the same run
+    hangover_ms: float = 200.0           # gap that still counts as the same run
+    leak_rate: float = 0.5               # after the hangover, accumulated speech decays at this rate (1e9 = hard reset)
     stop_after_ms: float = 520.0         # speech needed in a run before STOP
     loud_bonus_db: float = 4.0           # louder than caller's usual level ...
     loud_shorten_ms: float = 120.0       # ... -> stop sooner
+    soft_rel_db: float = 0.0             # run (p80 level) below caller's level by more than this ...
+    soft_ms_per_db: float = 300.0        # ... -> need this much more speech per extra dB
+    soft_extra_ms: float = 4000.0        # cap
+    flux_low: float = 0.0                # mean spectral change below this = sustained sound (0 = off)
+    flux_extra_ms: float = 300.0
     bc_zone_ms: float = 450.0            # after an agent phrase end, backchannels are expected
     bc_zone_extend_ms: float = 160.0     # ... -> need more speech
     question_zone_ms: float = 1200.0     # after an agent question mid-utterance
@@ -47,10 +54,14 @@ class Config:
     clf_gain_ms: float = 200.0           # p=1 -> stop 200 ms sooner, p=0 -> 200 ms later
 
     # ---- soft stop + RESUME ----
-    soft_stop: bool = False
-    soft_stop_after_ms: float = 300.0    # early STOP when soft_stop is on
-    resume_if_run_under_ms: float = 600.0
-    resume_window_ms: float = 450.0      # must be < 500 ms for KEEP half credit
+    soft_stop: bool = False              # stop EARLY (soft_stop_after_ms), rely on RESUME
+    soft_stop_after_ms: float = 300.0
+    resume: bool = False                 # take back a stop if the caller goes quiet fast
+    resume_if_run_under_ms: float = 900.0   # only if the whole run was this short
+    resume_gap_ms: float = 140.0         # caller silence before we resume
+    resume_window_ms: float = 3000.0     # <500 ms after STOP = half credit; later still un-silences the agent
+    max_resumes: int = 3                 # per agent utterance
+    after_resume_extra_ms: float = 150.0
 
     extra: dict = field(default_factory=dict)
 

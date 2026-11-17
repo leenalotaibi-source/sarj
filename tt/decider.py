@@ -4,7 +4,10 @@ Pure Python, no I/O, so it can be unit-tested and replayed offline.
 """
 from __future__ import annotations
 
+import collections
 import re
+
+import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -33,6 +36,22 @@ class AgentPlan:
     question_ends_ms: List[float] = field(default_factory=list)
 
 
+def estimate_word_times(text: str, duration_ms: float) -> List[Word]:
+    """No word timings from the kit: spread the utterance duration over the
+    words by character count, with extra weight for punctuation pauses."""
+    toks = text.split()
+    if not toks:
+        return []
+    weights = [len(w) + (4 if _PUNCT_END.search(w) else 1) for w in toks]
+    scale = duration_ms / sum(weights)
+    out, t = [], 0.0
+    for w, wt in zip(toks, weights):
+        speak = (len(w) + 1) * scale
+        out.append(Word(w, t, t + speak))
+        t += wt * scale
+    return out
+
+
 def parse_agent_info(*args, **kwargs) -> AgentPlan:
     """Accept whatever the kit passes at agent start (dict, object, text, words)."""
     info = {}
@@ -43,6 +62,8 @@ def parse_agent_info(*args, **kwargs) -> AgentPlan:
             info.setdefault("text", a)
         elif isinstance(a, (list, tuple)):
             info.setdefault("words", a)
+        elif isinstance(a, (int, float)) and not isinstance(a, bool):
+            info.setdefault("duration_ms", float(a))
         elif a is not None and hasattr(a, "__dict__"):
             info.update(vars(a))
     info.update(kwargs)
@@ -59,6 +80,8 @@ def parse_agent_info(*args, **kwargs) -> AgentPlan:
         except Exception:
             continue
         plan.words.append(Word(t, s, e))
+    if not plan.words and plan.text and float(info.get("duration_ms") or 0) > 0:
+        plan.words = estimate_word_times(plan.text, float(info["duration_ms"]))
     # timings in seconds? convert if the whole utterance is < 100 "units"
     if plan.words and plan.words[-1].end_ms < 100:
         for w in plan.words:
@@ -79,6 +102,7 @@ class Decider:
         self.cfg = cfg or Config()
         self.fe = Frontend(self.cfg)
         self.caller_ref_db = None   # caller's own speaking level (near-field)
+        self._ref_levels = collections.deque(maxlen=500)
         self.log = []               # (t_ms, event, details) for failure analysis
         self.agent_on = False
         self.plan = AgentPlan()
@@ -99,10 +123,12 @@ class Decider:
         self.stopped = False
         self.stop_t = None
         self.resumed = False
+        self.n_resumes = 0
         self.run_speech = 0.0
         self.run_gap = 1e9
         self.run_start = None
         self.run_levels = []
+        self.run_flux = []
         self.last_agent_voice_t = 0.0
         self.run_in_pause = False
         self.run_frames = []
@@ -131,9 +157,12 @@ class Decider:
 
         if not self.agent_on:
             # the caller is the main speaker now: learn their near-field level
+            # robust: a high percentile of the caller's speech frames, so weak
+            # onsets/offsets and background talk do not pull it down
             if f.is_speech and f.snr_db > cfg.snr_strong_db:
-                self.caller_ref_db = f.excess_db if self.caller_ref_db is None else \
-                    0.97 * self.caller_ref_db + 0.03 * f.excess_db
+                self._ref_levels.append(f.excess_db)
+                if len(self._ref_levels) >= 10:
+                    self.caller_ref_db = float(np.percentile(self._ref_levels, cfg.caller_ref_pct))
             return None
 
         if f.agent_db > -50:
@@ -144,10 +173,12 @@ class Decider:
         if speech and self._is_background(f):
             speech = False
         if speech:
-            if self.run_gap > cfg.hangover_ms:
+            # a new run only once the previous one has fully leaked away
+            if self.run_gap > cfg.hangover_ms and self.run_speech <= 0:
                 self.run_start = t
                 self.run_speech = 0.0
                 self.run_levels = []
+                self.run_flux = []
                 self.run_in_pause = (t - self.last_agent_voice_t) > 150
                 self.run_frames = []
                 self.run_ctx = self.context(t)
@@ -155,9 +186,14 @@ class Decider:
                 self.run_start_abs = self.abs_t
             self.run_speech += cfg.frame_ms
             self.run_levels.append(f.excess_db)
+            self.run_flux.append(f.flux)
             self.run_gap = 0.0
         else:
             self.run_gap += cfg.frame_ms
+            if self.run_gap > cfg.hangover_ms and self.run_speech > 0:
+                # leaky accumulation: short words separated by pauses
+                # ("لا … لا … لحظة") add up; isolated sounds fade out
+                self.run_speech = max(0.0, self.run_speech - cfg.leak_rate * cfg.frame_ms)
         if self.run_start is not None and self.run_gap <= cfg.hangover_ms:
             self.run_frames.append(f)
             n_ms = len(self.run_frames) * cfg.frame_ms
@@ -171,11 +207,15 @@ class Decider:
 
         # ---- after a (soft) stop: maybe take it back ----
         if self.stopped:
-            if (cfg.soft_stop and not self.resumed and run_ended
+            if (cfg.resume and self.n_resumes < cfg.max_resumes
+                    and self.run_gap >= cfg.resume_gap_ms
                     and self.run_speech < cfg.resume_if_run_under_ms
                     and t - self.stop_t <= cfg.resume_window_ms):
+                # the caller went quiet again quickly: it was a backchannel /
+                # noise, not a turn claim -> take the stop back
                 self.stopped = False
                 self.resumed = True
+                self.n_resumes += 1
                 self._log(t, RESUME, f)
                 return RESUME
             return None
@@ -211,12 +251,22 @@ class Decider:
         else:
             need = cfg.stop_after_ms
             if self.resumed:
-                need += 150.0  # we were wrong once this utterance; be stricter
+                need += cfg.after_resume_extra_ms  # we were wrong once this utterance
         start = self.run_start
         if self.run_levels and self.caller_ref_db is not None:
-            lvl = sum(self.run_levels) / len(self.run_levels)
-            if lvl > self.caller_ref_db + cfg.loud_bonus_db:
+            # someone claiming the floor speaks at full voice; backchannels,
+            # fillers, side talk and background are softer than the caller's
+            # own turn level
+            rel = float(np.percentile(self.run_levels, 80)) - self.caller_ref_db
+            if rel > cfg.loud_bonus_db:
                 need -= cfg.loud_shorten_ms
+            elif rel < -cfg.soft_rel_db:
+                # graded, not a cliff: every dB softer asks for more evidence
+                need += min(cfg.soft_extra_ms, cfg.soft_ms_per_db * (-rel - cfg.soft_rel_db))
+        if self.run_flux and len(self.run_flux) >= 5:
+            # little spectral change = one sustained sound (أها، اممم، هيه), a horn
+            if sum(self.run_flux) / len(self.run_flux) < cfg.flux_low:
+                need += cfg.flux_extra_ms
         if self._in_zone(start, self.plan.phrase_ends_ms, cfg.bc_zone_ms):
             need += cfg.bc_zone_extend_ms
         elif not self.plan.phrase_ends_ms and self.run_in_pause:

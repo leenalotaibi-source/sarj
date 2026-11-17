@@ -3,9 +3,9 @@
 All logic lives in tt/ (pure, testable). This file only adapts it to the kit's
 `System` interface and makes sure nothing ever raises out of a callback.
 
-NOTE: written before we had the kit in the repo. Check against the kit's
-example system (INTERFACE.md): how an action is emitted (return value vs a
-send method) and the exact on_agent_start arguments. Adjust `_emit` only.
+Kit interface (ttbench/server.py): on_scenario_start(context),
+on_agent_start(text, duration_ms), on_agent_end(), on_frame(agent, caller)
+-> None | "STOP" | "RESUME" | "TAKE_TURN".
 """
 from __future__ import annotations
 
@@ -19,15 +19,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tt.config import Config  # noqa: E402
 from tt.decider import Decider  # noqa: E402
 
-try:  # the kit provides the base class
-    from ttbench.system import System  # type: ignore
-except Exception:  # pragma: no cover - lets us run offline without the kit
-    try:
-        from ttbench import System  # type: ignore
-    except Exception:
-        class System:  # minimal stand-in
-            def __init__(self, *a, **k):
-                pass
+try:  # the kit provides the base class and the WebSocket runner
+    from ttbench.server import System, run  # type: ignore
+except Exception:  # pragma: no cover - lets tools/ run offline without the kit
+    run = None
+
+    class System:  # minimal stand-in
+        def on_scenario_start(self, context): ...
+
+
+TEAM = "my-team"            # TODO: real team name
 
 
 def _config_from_env() -> Config:
@@ -41,32 +42,20 @@ def _config_from_env() -> Config:
 
 
 class MySystem(System):
-    def __init__(self, *args, **kwargs):
-        try:
-            super().__init__(*args, **kwargs)
-        except Exception:
-            pass
+    def __init__(self):
         self.cfg = _config_from_env()
         self.dec = Decider(self.cfg)
         self.debug = bool(os.environ.get("TT_DEBUG"))
         self._slow = 0
 
-    # ---------------------------------------------------------------- output
-    def _emit(self, action):
-        """Return the action; if the kit uses a send-style method, call it too."""
-        if action is None:
-            return None
-        for name in ("send", "send_action", "emit"):
-            fn = getattr(super(), name, None)
-            if callable(fn):
-                try:
-                    fn(action)
-                except Exception:
-                    pass
-                break
-        return action
-
     # ------------------------------------------------------------- callbacks
+    def on_scenario_start(self, context=None):
+        """New call: fresh echo/noise/caller-level state (one connection serves many calls)."""
+        try:
+            self.dec = Decider(self.cfg)
+        except Exception:
+            self._err()
+
     def on_agent_start(self, *args, **kwargs):
         try:
             self.dec.agent_start(*args, **kwargs)
@@ -93,8 +82,12 @@ class MySystem(System):
                 print(f"[tt] slow frame {dt*1000:.1f} ms", file=sys.stderr)
         if action and self.debug:
             print(f"[tt] {self.dec.log[-1]}", file=sys.stderr)
-        return self._emit(action)
+        return action
 
     def _err(self):
         if self.debug:
             traceback.print_exc()
+
+
+if __name__ == "__main__":
+    run(MySystem, TEAM, __file__)

@@ -28,7 +28,7 @@ def to_float(x) -> np.ndarray:
 
 class FrameFeatures:
     __slots__ = ("caller_db", "agent_db", "excess_db", "snr_db", "voicing",
-                 "vad_prob", "echo_frac", "is_speech")
+                 "vad_prob", "echo_frac", "is_speech", "flux")
 
     def __repr__(self):
         return ("FF(snr=%.1f exc=%.1f ag=%.1f voi=%.2f vad=%s echo=%.2f sp=%s)" %
@@ -109,6 +109,7 @@ class Frontend:
         self._reset_echo()
         self.noise = np.full(self.nb, FLOOR * 10)
         self.prev_caller = np.zeros(n, dtype=np.float32)
+        self.prev_shape = None
         self._rise_noise = 10 ** (self.cfg.noise_rise_db_per_s * self.cfg.frame_ms / 1000 / 10)
 
     def _reset_echo(self):
@@ -188,6 +189,12 @@ class Frontend:
         if self.frame_no % 25 == 0:
             self._update_lag()
 
+        # noise floor of the raw caller channel (minimum statistics: fast down,
+        # slow up). Stationary noise must not be mistaken for echo below.
+        down = Pc < self.noise
+        self.noise = np.where(down, 0.8 * self.noise + 0.2 * Pc, self.noise * self._rise_noise)
+        self.noise = np.maximum(self.noise, FLOOR)
+
         # echo reference: agent power at the estimated delay (+-1 frame smear),
         # or the max over all plausible delays while the delay is unknown.
         hist = list(self.agent_hist)
@@ -206,7 +213,7 @@ class Frontend:
         ref3 = np.mean(self.ref_s, axis=0)
         agent_active = ref3.sum() > 1e-7
         if agent_active:
-            self.ratio_hist.append(np.log10(pc3 / ref3))
+            self.ratio_hist.append(np.log10(np.maximum(pc3 - self.noise, FLOOR) / ref3))
             if len(self.ratio_hist) >= 25 and self.frame_no % 5 == 0:
                 med = np.percentile(np.array(self.ratio_hist), cfg.echo_percentile, axis=0)
                 self.H = np.clip(10 ** med, 1e-7, 4.0)
@@ -216,13 +223,6 @@ class Frontend:
         excess = np.maximum(Pc - over * echo_est, 0.0)
         echo_frac = float(min(1.0, echo_est.sum() / Pc.sum()))
 
-        # noise floor on the echo-free part
-        src = excess if agent_active else Pc
-        if not agent_active or echo_frac < 0.5:
-            down = src < self.noise
-            self.noise = np.where(down, 0.8 * self.noise + 0.2 * src, self.noise * self._rise_noise)
-            self.noise = np.maximum(self.noise, FLOOR)
-
         ex_sum = float(excess.sum())
         f = FrameFeatures()
         f.caller_db = caller_db
@@ -231,6 +231,12 @@ class Frontend:
         f.snr_db = 10 * math.log10((ex_sum + EPS) / self.noise.sum())
         f.voicing = self._voicing(c)
         f.echo_frac = echo_frac
+        # spectral change vs previous frame (articulation: consonants, vowel
+        # changes). Level-normalised log spectrum, only bands above noise.
+        shape = 10 * np.log10(np.maximum(excess, self.noise))
+        shape = shape - shape.mean()
+        f.flux = 0.0 if self.prev_shape is None else float(np.mean(np.abs(shape - self.prev_shape)))
+        self.prev_shape = shape
         self.prev_caller = c
 
         f.vad_prob = None
