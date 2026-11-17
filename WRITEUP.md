@@ -29,8 +29,8 @@ Plateau, not a peak: Core stays 84–92 for caller-level percentile 70–90 and 
 
 ## Failure cases (≥ 5, with Arabic examples)
 1. **GI-D03 "لحظة."** (car noise): one 450 ms word right at an agent phrase end, and the caller then goes silent. Acoustically it looks like a backchannel. Fix: words layer (ASR + stop lexicon: لحظة، لا، بس، اسمع).
-2. **BG-D03 "يُمّه! وين الشاحن؟"**: the caller talks to someone in the room, at full voice. Level and duration both say "interruption". Fix: words (addressee) or prosody (shouting/far-directed).
-3. **OV-D02 "الوطنية، أيوه، معايا."**: a 2.4 s multi-word backchannel at normal level. Duration rule fires. Fix: lexicon of acknowledgement phrases.
+2. **BG-D03 "يُمّه! وين الشاحن؟"** (failed in v1, passes in v2): the caller talks to someone in the room. v2 keeps talking only because this side talk is softer than the caller's own turn. A caller who shouts at the room would still trigger a stop. Real fix: words (addressee).
+3. **OV-D02 "الوطنية، أيوه، معايا."** (failed in v1, passes in v2 by level only): a 2.4 s multi-word backchannel. Duration alone fires. A robust fix is a lexicon of acknowledgement phrases.
 4. **GI-D02 "أيوه… … بس أبغى أغيّر الموعد"**: the intent is only evident at "بس". We stop late (≈0.9 s), because "أيوه" + pauses look like a backchannel.
 5. **BG-D01 (TV speech)** during the agent's *first* utterance: the caller has not spoken yet, so there is no caller level to compare against and the TV can trigger a stop.
 6. **Risk:** a caller who interrupts *softly* (tired, polite) is penalised by the level rule. The synthetic stress test with random interruption levels shows a big responsiveness drop.
