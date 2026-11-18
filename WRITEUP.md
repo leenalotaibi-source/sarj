@@ -27,6 +27,17 @@ No internet access is needed at runtime.
 
 Plateau, not a peak: Core stays 84–92 for caller-level percentile 70–90 and stop threshold 440–600 ms.
 
+## Generalisation check against the team's P3 (offline replay, official scorer)
+
+| System | dev (24) | xdev (25, team's dev split) | holdout (25, frozen) |
+|---|---|---|---|
+| P3 hybrid (Silero + caller-relative, b32cfc2) | 73.4 | 95.8 | 82.0 |
+| v2 (this branch) | **92.2** | 68.5 | **85.4** |
+
+- P3 stops after 200 ms of normal-level speech: it catches one-word commands (توقف، لا) but also stops on clear backchannels ("أها" in BC-D02; BC restraint 0.20 dev / 0.12 holdout).
+- v2 waits ~520 ms and longer for softer speech or speech at agent phrase ends: backchannels pass, but isolated one-word commands in xdev ("توقف", 0.5 s) are missed.
+- In xdev, a single "نعم" is KEEP and a single "توقف" is STOP. No acoustic cue separates them, so this needs the words layer (keyword spotting).
+
 ## Failure cases (≥ 5, with Arabic examples)
 1. **GI-D03 "لحظة."** (car noise): one 450 ms word right at an agent phrase end, and the caller then goes silent. Acoustically it looks like a backchannel. Fix: words layer (ASR + stop lexicon: لحظة، لا، بس، اسمع).
 2. **BG-D03 "يُمّه! وين الشاحن؟"** (failed in v1, passes in v2): the caller talks to someone in the room. v2 keeps talking only because this side talk is softer than the caller's own turn. A caller who shouts at the room would still trigger a stop. Real fix: words (addressee).
