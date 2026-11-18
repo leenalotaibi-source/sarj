@@ -56,6 +56,7 @@ class Config:
     # ---- words layer (tt/words.py) ----
     use_words: bool = True               # falls back to acoustics only if the model is missing
     asr_model_dir: str = "models/faster-whisper-tiny"
+    asr_kws: bool = True                 # Whisper keyword spotting on top of the free transcript (tt/words.py)
     asr_min_speech_ms: float = 160.0     # transcribe once a run has this much speech
     asr_every_ms: float = 200.0          # re-transcribe the growing run this often
     asr_pre_ms: float = 200.0            # audio kept before the run start

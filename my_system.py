@@ -62,7 +62,7 @@ class MySystem(System):
         if not os.path.isabs(path):
             path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
         try:
-            return WordsWorker(shared_backend(path))
+            return WordsWorker(shared_backend(path, kws=self.cfg.asr_kws))
         except Exception:
             # no model / no faster-whisper: run on acoustics alone, never crash
             print(f"[tt] words layer disabled: cannot load ASR from {path}", file=sys.stderr)

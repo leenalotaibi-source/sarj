@@ -64,9 +64,10 @@ The gain depends on latency, not just accuracy: a model must return in ≲ 500 m
 | P3 (team) | 73.4 | 73.41 (team's run) | 95.8 | 82.0 |
 | v2 acoustic | 92.2 | 92.4 | 68.5 | 85.4 |
 | v3a words, token = +800 ms | 94.4 | 90.7 | 83.9 | 84.3 |
-| **v3 words, token = run must outlast a backchannel** | **96.2** | **96.4** | 84.0 | **87.1** |
+| v3 words, token = run must outlast a backchannel | 96.2 | 96.4 | 84.0 | **87.1** |
+| **v4 = v3 + Whisper keyword spotting** | **97.5** | **97.4** | **87.0** | 85.3 |
 
-Holdout was scored twice (v3a, then the final v3), and no parameter was chosen from it. Real-time v3: 0 protocol errors, max send lag 31 ms.
+Holdout was scored three times (v3a, v3, v4), and no parameter was chosen from it. Real-time v3: 0 protocol errors, max send lag 31 ms.
 
 Lessons:
 - **Latency beats accuracy.** Whisper base is more accurate, but at 500–700 ms per request its words arrive too late (dev 92.2, xdev 69.6). tiny takes ~300 ms.
@@ -77,6 +78,26 @@ Lessons:
   3. One-edit fuzzy matching for distinctive command words ("لاحظة" → لحظة). "ماشي" must not become "مابي".
 - Background voices say stop words too (BG-D53: "بس" at −7.5 dB). A stop word only counts at near the caller's own level.
 - If the model folder is missing, the system runs on acoustics alone (test: `tests/test_my_system.py`).
+
+### v4: keyword spotting for isolated commands ("توقف")
+
+Free transcription fails on one isolated word: Whisper tiny writes "توقف" as "تبقص" or "لطوق في الغر", and "لا إلغاء" as "لأكيدها".
+
+Instead, v4 asks the same model how likely each candidate word is, by forced alignment on the same encoding:
+- stop candidates: لا، توقف، لحظة، إلغاء، اسمع
+- listener candidates: نعم، إيه، أيوه، أها، طيب، تمام
+
+If the best stop word beats the best listener word by ≥ 0.3 (mean log-probability), and scores ≥ −2.5, it counts as heard.
+
+| Variant (dev + xdev: 18 STOP / 32 KEEP events) | time / request | stop words caught | KEEP heard as stop |
+|---|---|---|---|
+| free transcript only (v3) | ~330 ms | 8/18 | 0/32 |
+| + keywords, 30 s window | ~950 ms | 13/18 | 0/32 |
+| **+ keywords, 10 s window, 11 candidates (v4)** | **~190 ms** | **12/18** | **0/32** |
+
+- **Faster:** Whisper normally pads every clip to 30 s. Encoding only a 10 s window cuts encoding from ~350 ms to ~40 ms with almost no loss on 1–3 s clips. v4 is faster than v3 even though it does more.
+- **Closed-set trap:** a word missing from the candidate list is matched to its nearest candidate. "طيب" (AM-D01) was scored as "توقف" until "طيب" and "تمام" were added as listener candidates. Common listener words must be in the list.
+- **Holdout:** 87.1 → 85.3. Responsiveness rose (0.919 → 0.944), but one background-speech event became a false stop. Not tuned further on holdout.
 
 ## Failure cases (≥ 5, with Arabic examples)
 1. **GI-D03 "لحظة."** (car noise): one 450 ms word right at an agent phrase end, and the caller then goes silent. Acoustically it looks like a backchannel. Fix: words layer (ASR + stop lexicon: لحظة، لا، بس، اسمع).

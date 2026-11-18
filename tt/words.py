@@ -115,18 +115,81 @@ class FasterWhisperBackend:
         return " ".join(s.text for s in segs if s.no_speech_prob < 0.6).strip()
 
 
+class WhisperKWSBackend:
+    """Whisper tiny used twice on ONE encoding of the clip (~190 ms on 2 CPU threads):
+
+    1. free transcript (greedy, <= 12 tokens), classified by the lexicon;
+    2. keyword spotting: the probability Whisper gives each candidate word
+       (forced alignment). One isolated word is where free transcription
+       fails ("توقف" -> "تبقص"), but "is it توقف or نعم?" is easy for it.
+
+    Speed: the clip is encoded in a 10 s window instead of Whisper's 30 s
+    (encode ~40 ms instead of ~350 ms), with a small candidate list.
+    If keyword spotting is confident that a stop word was said, that word is
+    put in front of the transcript, so the lexicon sees it.
+    Thresholds were chosen on dev + xdev (18 STOP / 32 KEEP events):
+    12/18 caught (free transcript alone: 8/18), 0/32 false, ~190 ms per request.
+    """
+
+    STOP_CANDIDATES = ("لا", "توقف", "لحظة", "إلغاء", "اسمع")
+    # common listener words MUST be candidates: a word missing from the list is
+    # matched to its nearest candidate ("طيب" -> "توقف" before "طيب" was added)
+    KEEP_CANDIDATES = ("نعم", "إيه", "أيوه", "أها", "طيب", "تمام")
+
+    def __init__(self, model_dir: str, threads: int = 2, window_frames: int = 1000,
+                 margin: float = 0.3, min_score: float = -2.5, no_speech: float = 0.6):
+        import ctranslate2  # optional dependency (comes with faster-whisper)
+        from faster_whisper import WhisperModel
+        from faster_whisper.tokenizer import Tokenizer
+        self._ct2 = ctranslate2
+        self.model = WhisperModel(model_dir, device="cpu", compute_type="int8", cpu_threads=threads)
+        self.tok = Tokenizer(self.model.hf_tokenizer, True, task="transcribe", language="ar")
+        self.start = list(self.tok.sot_sequence) + [self.tok.no_timestamps]
+        self.cands = list(self.STOP_CANDIDATES) + list(self.KEEP_CANDIDATES)
+        self.cand_tokens = [self.tok.encode(" " + c) for c in self.cands]
+        self.n_stop = len(self.STOP_CANDIDATES)
+        self.window, self.margin, self.min_score, self.no_speech = window_frames, margin, min_score, no_speech
+        self.last_scores: dict = {}
+        self.transcribe(np.zeros(16000, dtype=np.int16))  # warm-up before the call starts
+
+    def transcribe(self, audio: np.ndarray, **_ctx) -> str:
+        x = audio.astype(np.float32) / 32768.0
+        f = self.model.feature_extractor(x)[:, -self.window:]       # newest audio if longer than the window
+        n = f.shape[-1]
+        f = np.pad(f, ((0, 0), (0, self.window - n)))
+        enc = np.array(self.model.encode(f))
+        ct2 = self._ct2
+        g = self.model.model.generate(ct2.StorageView.from_array(enc), [self.start], beam_size=1,
+                                      max_length=len(self.start) + 12, return_no_speech_prob=True)[0]
+        if g.no_speech_prob > self.no_speech:
+            self.last_scores = {}
+            return ""
+        text = self.tok.decode([t for t in g.sequences_ids[0] if t < self.tok.eot]).strip()
+        res = self.model.model.align(ct2.StorageView.from_array(np.repeat(enc, len(self.cands), axis=0)),
+                                     self.start, self.cand_tokens, n)
+        sc = [float(np.mean(np.log(np.asarray(r.text_token_probs[:len(t)]) + 1e-9)))
+              for r, t in zip(res, self.cand_tokens)]
+        self.last_scores = dict(zip(self.cands, sc))
+        i_stop = int(np.argmax(sc[:self.n_stop]))
+        best_stop, best_keep = sc[i_stop], max(sc[self.n_stop:])
+        if best_stop - best_keep >= self.margin and best_stop >= self.min_score:
+            text = f"{self.cands[i_stop]} {text}".strip()      # keyword spotting heard a stop word
+        return text
+
+
 # ------------------------------------------------------------------ worker
 _BACKENDS: dict = {}
 _BACKENDS_LOCK = threading.Lock()
 
 
-def shared_backend(model_dir: str, threads: int = 2) -> "FasterWhisperBackend":
+def shared_backend(model_dir: str, threads: int = 2, kws: bool = True):
     """One loaded model per process, shared by every MySystem instance (a
     server that creates a system per call must not reload Whisper each time)."""
-    key = (model_dir, threads)
+    key = (model_dir, threads, kws)
     with _BACKENDS_LOCK:
         if key not in _BACKENDS:
-            _BACKENDS[key] = FasterWhisperBackend(model_dir, threads=threads)
+            cls = WhisperKWSBackend if kws else FasterWhisperBackend
+            _BACKENDS[key] = cls(model_dir, threads=threads)
         return _BACKENDS[key]
 
 

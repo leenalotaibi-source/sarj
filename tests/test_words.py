@@ -71,3 +71,19 @@ def test_worker_thread_ends_with_its_owner():
     gc.collect()
     _t.sleep(2.5)
     assert threading.active_count() == before
+
+
+MODEL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", "faster-whisper-tiny")
+
+
+def test_kws_backend_on_silence_and_candidates():
+    import pytest
+    if not os.path.isdir(MODEL):
+        pytest.skip("Whisper tiny not downloaded (models/faster-whisper-tiny)")
+    from tt.words import WhisperKWSBackend
+    b = WhisperKWSBackend(MODEL)
+    assert b.transcribe(np.zeros(16000, np.int16)) == ""          # no speech -> nothing, no keyword guess
+    # every keep candidate is a listener token, every stop candidate a stop word, for the lexicon too
+    assert all(classify(c) == "keep" for c in b.KEEP_CANDIDATES)
+    assert all(classify(c) == "stop" for c in b.STOP_CANDIDATES)
+    assert "طيب" in b.KEEP_CANDIDATES      # regression: without it, "طيب" was matched to "توقف"
