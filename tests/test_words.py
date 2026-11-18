@@ -53,3 +53,21 @@ def test_stale_result_from_previous_utterance_is_ignored():
     d.words._busy = True
     d.frame(np.zeros(320, np.int16), np.zeros(320, np.int16))
     assert d.word_verdict is None
+
+
+def test_worker_thread_ends_with_its_owner():
+    import gc
+    import threading
+    import time as _t
+    before = threading.active_count()
+    w = WordsWorker(_Fixed("نعم"))
+    assert w.submit("r", np.zeros(320, np.int16), now_ms=0)
+    for _ in range(100):
+        if w.poll(0):
+            break
+        _t.sleep(0.01)
+    assert threading.active_count() == before + 1
+    del w
+    gc.collect()
+    _t.sleep(2.5)
+    assert threading.active_count() == before

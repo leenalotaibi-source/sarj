@@ -62,6 +62,7 @@ class Config:
     asr_window_ms: float = 3000.0        # at most this much audio per request
     asr_final_within_ms: float = 600.0   # after the run ends, one last request (complete word) within this gap
     word_stop_min_ms: float = 100.0
+    word_stop_max_gap_ms: float = 1000.0 # a stop word that arrives later than this after the caller fell silent is ignored (slow CPU)
     word_stop_soft_db: float = 6.0       # a stop word from a voice this much softer than the caller (TV, room) is ignored      # a stop word needs at least this much speech
     keep_word_min_run_ms: float = 800.0  # only listener tokens heard -> the run must last this long
     content_word_shorten_ms: float = 0.0

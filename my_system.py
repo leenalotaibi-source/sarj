@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from tt.config import Config  # noqa: E402
 from tt.decider import Decider  # noqa: E402
-from tt.words import FasterWhisperBackend, WordsWorker  # noqa: E402
+from tt.words import WordsWorker, shared_backend  # noqa: E402
 
 try:  # the kit provides the base class and the WebSocket runner
     from ttbench.server import System, run  # type: ignore
@@ -59,7 +59,7 @@ class MySystem(System):
         if not os.path.isabs(path):
             path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
         try:
-            return WordsWorker(FasterWhisperBackend(path))
+            return WordsWorker(shared_backend(path))
         except Exception:
             # no model / no faster-whisper: run on acoustics alone, never crash
             print(f"[tt] words layer disabled: cannot load ASR from {path}", file=sys.stderr)

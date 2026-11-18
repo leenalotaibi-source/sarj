@@ -19,6 +19,7 @@ import queue
 import re
 import threading
 import time
+import weakref
 from typing import Optional
 
 import numpy as np
@@ -115,6 +116,36 @@ class FasterWhisperBackend:
 
 
 # ------------------------------------------------------------------ worker
+_BACKENDS: dict = {}
+_BACKENDS_LOCK = threading.Lock()
+
+
+def shared_backend(model_dir: str, threads: int = 2) -> "FasterWhisperBackend":
+    """One loaded model per process, shared by every MySystem instance (a
+    server that creates a system per call must not reload Whisper each time)."""
+    key = (model_dir, threads)
+    with _BACKENDS_LOCK:
+        if key not in _BACKENDS:
+            _BACKENDS[key] = FasterWhisperBackend(model_dir, threads=threads)
+        return _BACKENDS[key]
+
+
+def _serve(q: "queue.Queue", backend, ready: list, lock: threading.Lock, owner: "weakref.ref"):
+    """Worker thread. Holds no reference to the WordsWorker itself, so the
+    thread ends shortly after its owner (one call / one demo session) is gone."""
+    while owner() is not None:
+        try:
+            req_id, audio = q.get(timeout=2.0)
+        except queue.Empty:
+            continue
+        try:
+            text = backend.transcribe(audio)
+        except Exception:
+            text = ""
+        with lock:
+            ready.append((0.0, req_id, text))
+
+
 class WordsWorker:
     """One request in flight at a time; newest result wins.
 
@@ -131,7 +162,8 @@ class WordsWorker:
         self._lock = threading.Lock()
         if not sync:
             self._q: "queue.Queue" = queue.Queue(maxsize=1)
-            threading.Thread(target=self._loop, daemon=True).start()
+            threading.Thread(target=_serve, args=(self._q, backend, self._ready, self._lock, weakref.ref(self)),
+                             daemon=True).start()
 
     @property
     def busy(self) -> bool:
@@ -153,22 +185,12 @@ class WordsWorker:
             self._q.put((req_id, audio))
         return True
 
-    def _loop(self):
-        while True:
-            req_id, audio = self._q.get()
-            try:
-                text = self.backend.transcribe(audio)
-            except Exception:
-                text = ""
-            with self._lock:
-                self._ready.append((0.0, req_id, text))
-
     def poll(self, now_ms: float):
         with self._lock:
             due = [r for r in self._ready if r[0] <= now_ms]
             if not due:
                 return None
-            self._ready = [r for r in self._ready if r[0] > now_ms]
+            self._ready[:] = [r for r in self._ready if r[0] > now_ms]
         self._busy = False
         _, req_id, text = due[-1]
         return req_id, text

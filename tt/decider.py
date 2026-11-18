@@ -242,6 +242,7 @@ class Decider:
         # ---- words layer ----
         if self.words is not None:
             if (self.word_verdict == "stop" and self.run_speech >= cfg.word_stop_min_ms
+                    and self.run_gap <= cfg.word_stop_max_gap_ms
                     and self._run_rel_db() >= -cfg.word_stop_soft_db):
                 # a floor-claiming word ("لا", "لحظة", "توقف"): stop now, even
                 # if the caller already fell silent while ASR was working
