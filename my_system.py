@@ -61,7 +61,8 @@ class MySystem(System):
         try:
             return WordsWorker(FasterWhisperBackend(path))
         except Exception:
-            self._err()
+            # no model / no faster-whisper: run on acoustics alone, never crash
+            print(f"[tt] words layer disabled: cannot load ASR from {path}", file=sys.stderr)
             return None
 
     def on_scenario_start(self, context=None):
@@ -100,7 +101,7 @@ class MySystem(System):
         return action
 
     def _err(self):
-        if self.debug:
+        if getattr(self, "debug", True):
             traceback.print_exc()
 
 

@@ -142,6 +142,7 @@ class Decider:
         self.clf_adjust = 0.0
         self.word_verdict = None
         self.word_text = ""
+        self.final_sent = False
 
     def agent_start(self, *args, **kwargs):
         self.agent_on = True
@@ -240,7 +241,8 @@ class Decider:
 
         # ---- words layer ----
         if self.words is not None:
-            if self.word_verdict == "stop" and self.run_speech >= cfg.word_stop_min_ms:
+            if (self.word_verdict == "stop" and self.run_speech >= cfg.word_stop_min_ms
+                    and self._run_rel_db() >= -cfg.word_stop_soft_db):
                 # a floor-claiming word ("لا", "لحظة", "توقف"): stop now, even
                 # if the caller already fell silent while ASR was working
                 self.stopped = True
@@ -249,6 +251,11 @@ class Decider:
                 return STOP
             if not run_ended:
                 self._submit_words()
+                self.final_sent = False
+            elif not self.final_sent and self.word_verdict is None and self.run_gap <= cfg.asr_final_within_ms:
+                # the caller just fell silent: transcribe the complete short
+                # word once ("لحظة." alone), the case acoustics cannot decide
+                self.final_sent = self._submit_words(final=True)
 
         if run_ended:
             return None
@@ -262,19 +269,27 @@ class Decider:
         return None
 
     # -------------------------------------------------------------- helpers
-    def _submit_words(self):
+    def _run_rel_db(self) -> float:
+        """Run level (80th pct) relative to the caller's own level; 0 if unknown."""
+        if not self.run_levels or self.caller_ref_db is None:
+            return 0.0
+        return float(np.percentile(self.run_levels, 80)) - self.caller_ref_db
+
+    def _submit_words(self, final: bool = False) -> bool:
         cfg = self.cfg
-        if (self.run_speech < cfg.asr_min_speech_ms or self.words.busy
-                or self.abs_t - self.last_submit < cfg.asr_every_ms):
-            return
+        if self.words.busy or (not final and (self.run_speech < cfg.asr_min_speech_ms
+                                              or self.abs_t - self.last_submit < cfg.asr_every_ms)):
+            return False
         t0 = self.run_start_abs - cfg.asr_pre_ms
         frames = [a for (ts, a) in self.audio if ts > t0]
         if not frames:
-            return
+            return False
         req = (id(self), self.utt_seq, self.run_seq)
         if self.words.submit(req, np.concatenate(frames), self.abs_t,
                              t0_ms=max(t0, self.abs_t - cfg.asr_window_ms), t1_ms=self.abs_t):
             self.last_submit = self.abs_t
+            return True
+        return False
 
     def _poll_words(self):
         res = self.words.poll(self.abs_t)
@@ -331,7 +346,10 @@ class Decider:
             need -= cfg.question_shorten_ms
         need += self.clf_adjust
         if self.word_verdict == "keep":
-            need += cfg.keep_word_extra_ms      # only listener tokens so far (نعم، أها، تمام)
+            # only listener tokens so far (نعم، أها، تمام). Arabic answers often
+            # START with one ("إيه الأحد، احجزه"), so a token cannot delay the
+            # stop forever: it only asks the run to outlast a backchannel.
+            need = max(need, cfg.keep_word_min_run_ms)
         elif self.word_verdict == "content":
             need -= cfg.content_word_shorten_ms
         return max(need, 160.0)

@@ -64,6 +64,10 @@ def run_once(scenarios, labels, manifest, cfg_spec: str = "", oracle_ms=None):
     stream, controls = build_stream(scenarios)
     sysm = my_system.MySystem()
     oracle = None
+    if sysm.words is not None:
+        # real ASR, run inline: each result is released after its measured
+        # compute time in STREAM time, so the score includes the ASR delay
+        sysm.words = WordsWorker(sysm.words.backend, sync=True)
     if oracle_ms is not None:
         oracle = OracleASR()
         sysm.words = WordsWorker(oracle, sync=True, latency_ms=oracle_ms)

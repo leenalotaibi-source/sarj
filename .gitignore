@@ -9,3 +9,4 @@ models/*.pt
 *.wav
 !tests/fixtures/*.wav
 !models/silero_vad.onnx
+models/faster-whisper-*/

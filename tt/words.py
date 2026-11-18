@@ -40,7 +40,7 @@ def normalize(text: str) -> str:
 # Words that claim the floor: objection, stop, wait, correction (Gulf/Najdi/Hijazi + MSA)
 STOP_WORDS = {
     "لا", "لاء", "لالا", "توقف", "وقف", "قف", "اوقف", "لحظه", "لحظة", "دقيقه", "ثانيه", "استنى", "استني", "انتظر",
-    "اصبر", "بس", "اسمع", "اسمعني", "اسمعيني", "الغ", "الغي", "الغاء", "كنسل", "سوري", "عفوا", "مو", "مب", "ماابي",
+    "اصبر", "بس", "لاحظه", "اسمع", "اسمعني", "اسمعيني", "الغ", "الغي", "الغاء", "كنسل", "سوري", "عفوا", "مو", "مب", "ماابي",
     "مابي", "ماابغى", "مابغى", "غلط", "خطا", "ثواني", "يكفي", "خلاص", "stop", "no", "wait", "cancel",
 }
 # Listener tokens: acknowledge and hand the floor back
@@ -53,6 +53,29 @@ KEEP_WORDS = {
 STOP_PHRASES = ("ما ابي", "ما ابغى", "مو كذا", "مب كذا", "ثانيه بس", "خلني اقول", "بقول لك", "عندي سوال")
 
 
+def _edit1(a: str, b: str) -> bool:
+    """True if a and b differ by at most one insert/delete/substitute."""
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) > len(b):
+        a, b = b, a
+    i = 0
+    while i < len(a) and a[i] == b[i]:
+        i += 1
+    return a[i + (len(a) == len(b)):] == b[i + 1:]
+
+
+# only distinctive command words get fuzzy matching ("ماشي" must not become "مابي")
+_FUZZY_STOP = ["لحظه", "توقف", "اوقف", "دقيقه", "استنى", "استني", "انتظر", "اسمع", "اسمعني", "الغاء", "ثانيه",
+               "ثواني", "كنسل", "اصبر"]
+
+
+def _is_stop(w: str) -> bool:
+    # ASR slips on longer words ("لاحظه" for "لحظه"): allow one edit there;
+    # short words (لا، بس، مو) must match exactly
+    return w in STOP_WORDS or (len(w) >= 4 and w not in KEEP_WORDS and any(_edit1(w, s) for s in _FUZZY_STOP))
+
+
 def classify(text: str) -> Optional[str]:
     """'stop' if any floor-claiming word, 'keep' if only listener tokens,
     'content' for other speech (>= 2 words), None if nothing usable."""
@@ -62,7 +85,7 @@ def classify(text: str) -> Optional[str]:
     if any(p in t for p in STOP_PHRASES):
         return "stop"
     toks = t.split()
-    if any(w in STOP_WORDS for w in toks):
+    if any(_is_stop(w) for w in toks):
         return "stop"
     other = [w for w in toks if w not in KEEP_WORDS]
     if not other:
@@ -82,10 +105,12 @@ class FasterWhisperBackend:
 
     def transcribe(self, audio: np.ndarray, **_ctx) -> str:
         x = audio.astype(np.float32) / 32768.0
+        # no initial_prompt: Whisper copies prompt words into the output on
+        # short clips (a "stop" word out of thin air). Short output cap: the
+        # cues are in the first few words, and it stops repetition loops.
         segs, _ = self.model.transcribe(
             x, language="ar", beam_size=1, best_of=1, temperature=0.0, condition_on_previous_text=False,
-            without_timestamps=True, vad_filter=False, no_speech_threshold=0.6,
-            initial_prompt="لا، لحظة، بس، توقف، نعم، إيه، أيوه، تمام")
+            without_timestamps=True, vad_filter=False, no_speech_threshold=0.6, max_new_tokens=12)
         return " ".join(s.text for s in segs if s.no_speech_prob < 0.6).strip()
 
 

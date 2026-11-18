@@ -4,3 +4,4 @@ scipy>=1.10          # synth data tools only (not needed at runtime)
 soundfile>=0.12      # synth data tools only
 scikit-learn>=1.3    # classifier training only
 onnxruntime>=1.16    # optional: Silero VAD if models/silero_vad.onnx is present
+faster-whisper>=1.0  # optional words layer (use_words=1); model: Systran/faster-whisper-tiny -> models/faster-whisper-tiny

@@ -54,14 +54,16 @@ class Config:
     clf_gain_ms: float = 200.0           # p=1 -> stop 200 ms sooner, p=0 -> 200 ms later
 
     # ---- words layer (tt/words.py) ----
-    use_words: bool = False
-    asr_model_dir: str = "models/faster-whisper-base"
+    use_words: bool = True               # falls back to acoustics only if the model is missing
+    asr_model_dir: str = "models/faster-whisper-tiny"
     asr_min_speech_ms: float = 160.0     # transcribe once a run has this much speech
     asr_every_ms: float = 200.0          # re-transcribe the growing run this often
     asr_pre_ms: float = 200.0            # audio kept before the run start
     asr_window_ms: float = 3000.0        # at most this much audio per request
-    word_stop_min_ms: float = 100.0      # a stop word needs at least this much speech
-    keep_word_extra_ms: float = 800.0    # only listener tokens heard -> wait this much longer
+    asr_final_within_ms: float = 600.0   # after the run ends, one last request (complete word) within this gap
+    word_stop_min_ms: float = 100.0
+    word_stop_soft_db: float = 6.0       # a stop word from a voice this much softer than the caller (TV, room) is ignored      # a stop word needs at least this much speech
+    keep_word_min_run_ms: float = 800.0  # only listener tokens heard -> the run must last this long
     content_word_shorten_ms: float = 0.0
 
     # ---- soft stop + RESUME ----
