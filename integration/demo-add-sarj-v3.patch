@@ -1,0 +1,3635 @@
+From e0dada0936f785cdfe781ae389caa7af4e408eaa Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 18 Nov 2026 17:05:35 +0000
+Subject: [PATCH] demo: add SARJ v3 as a third detector next to Baseline and P3
+
+SARJ v3 (leenalotaibi-source/sarj @ 18471a8): echo-aware acoustics,
+caller-relative level, leaky speech evidence and an Arabic stop/keep
+words layer (offline Whisper tiny). Official real-time dev run of the
+exact files served here: Core 96.38 (R 0.951, S 0.969), 1 false stop,
+0 misses, 0 protocol errors (experiments/evidence/v3-18471a8-rt).
+
+- server: multi-file detectors are pinned file by file ("files" in the
+  model spec); any changed module disables the detector instead of
+  running it. A detector may report which layers really loaded
+  (demo_note), shown in its description.
+- page: detectors are data-driven (cards, headline, results table,
+  timeline lanes, benchmark table); v3 is optional and shown only when
+  the server has it, Baseline and P3 remain required.
+- Dockerfile/requirements: faster-whisper, Whisper tiny fetched at build
+  time; without it v3 runs on acoustics alone and says so.
+- tests: three pinned detectors, v3 refuses a changed module, three
+  benchmark rows equal to runs.json (146 passed).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BHwakaZ8PDY7RCXJVGEr6w
+---
+ .gitignore                                    |   1 +
+ demo/Dockerfile                               |   6 +-
+ demo/benchmark.json                           |  11 +
+ demo/models/sarj_v3/my_system.py              | 112 +++
+ demo/models/sarj_v3/tt/__init__.py            |   0
+ demo/models/sarj_v3/tt/config.py              |  95 +++
+ demo/models/sarj_v3/tt/decider.py             | 363 ++++++++++
+ demo/models/sarj_v3/tt/frontend.py            | 256 +++++++
+ demo/models/sarj_v3/tt/prefix.py              |  68 ++
+ demo/models/sarj_v3/tt/words.py               | 196 +++++
+ demo/requirements-public.txt                  |   2 +
+ demo/server.py                                |  34 +-
+ demo/static/app.js                            |  93 ++-
+ demo/static/index.html                        |  19 +-
+ demo/static/style.css                         |   3 +-
+ experiments/evidence/runs.json                | 500 +++++++------
+ experiments/evidence/v3-18471a8-rt/log.jsonl  | 277 +++++++
+ experiments/evidence/v3-18471a8-rt/report.md  | 103 +++
+ experiments/evidence/v3-18471a8-rt/run.json   | 300 ++++++++
+ experiments/evidence/v3-18471a8-rt/score.json | 681 ++++++++++++++++++
+ render.yaml                                   |   2 +-
+ tests/test_demo.py                            |  29 +-
+ tests/test_demo_public.py                     |   6 +-
+ 23 files changed, 2871 insertions(+), 286 deletions(-)
+ create mode 100644 demo/models/sarj_v3/my_system.py
+ create mode 100644 demo/models/sarj_v3/tt/__init__.py
+ create mode 100644 demo/models/sarj_v3/tt/config.py
+ create mode 100644 demo/models/sarj_v3/tt/decider.py
+ create mode 100644 demo/models/sarj_v3/tt/frontend.py
+ create mode 100644 demo/models/sarj_v3/tt/prefix.py
+ create mode 100644 demo/models/sarj_v3/tt/words.py
+ create mode 100644 experiments/evidence/v3-18471a8-rt/log.jsonl
+ create mode 100644 experiments/evidence/v3-18471a8-rt/report.md
+ create mode 100644 experiments/evidence/v3-18471a8-rt/run.json
+ create mode 100644 experiments/evidence/v3-18471a8-rt/score.json
+
+diff --git a/.gitignore b/.gitignore
+index 5488a8f..30d882e 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -40,3 +40,4 @@ data/hidden/
+ # ESC-50 clips individually CC0 / CC BY). No competition data, no private recordings.
+ !data/extra/xdev/audio/*.wav
+ !data/extra/holdout/audio/*.wav
++demo/models/sarj_v3/models/
+diff --git a/demo/Dockerfile b/demo/Dockerfile
+index 6cc3f70..3ae253f 100644
+--- a/demo/Dockerfile
++++ b/demo/Dockerfile
+@@ -9,11 +9,15 @@ WORKDIR /app
+ COPY demo/requirements-public.txt demo/requirements-public.txt
+ RUN pip install --no-cache-dir -r demo/requirements-public.txt
+ 
+-# The two detectors: P3 (my_system.py + neural_vad.py + Silero VAD model) and the pinned Baseline file.
++# The detectors: P3 (my_system.py + neural_vad.py + Silero VAD model), the pinned Baseline file and SARJ v3
++# (demo/models/sarj_v3: my_system.py + tt/, every file pinned in demo/server.py).
+ COPY ttbench/ ttbench/
+ COPY my_system.py neural_vad.py ./
+ COPY models/silero_vad.onnx models/SILERO_VAD_LICENSE models/
+ COPY demo/models/ demo/models/
++# SARJ v3's words layer: Whisper tiny (OpenAI, MIT; CTranslate2 conversion Systran/faster-whisper-tiny), fetched once
++# at build time so the running site never downloads anything. If this step is removed, v3 runs on acoustics alone.
++RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('Systran/faster-whisper-tiny', local_dir='demo/models/sarj_v3/models/faster-whisper-tiny')"
+ # The demo itself.
+ COPY demo/server.py demo/live.py demo/collections.json demo/benchmark.json demo/
+ COPY demo/static/ demo/static/
+diff --git a/demo/benchmark.json b/demo/benchmark.json
+index 73d2a7b..6a39794 100644
+--- a/demo/benchmark.json
++++ b/demo/benchmark.json
+@@ -23,6 +23,17 @@
+       "S": 0.546,
+       "false_stops": 10,
+       "misses": 0
++    },
++    {
++      "model": "v3",
++      "run": "v3-18471a8-rt",
++      "commit": "18471a8",
++      "my_system_sha256": "09e5b65a117895dc15ce75a700cb48e313cd121c7ac1738559e320606cfcd1b8",
++      "core": 96.38,
++      "R": 0.951,
++      "S": 0.969,
++      "false_stops": 1,
++      "misses": 0
+     }
+   ]
+ }
+diff --git a/demo/models/sarj_v3/my_system.py b/demo/models/sarj_v3/my_system.py
+new file mode 100644
+index 0000000..355d7bb
+--- /dev/null
++++ b/demo/models/sarj_v3/my_system.py
+@@ -0,0 +1,112 @@
++"""Entry point for the Sarj turn-taking benchmark.
++
++All logic lives in tt/ (pure, testable). This file only adapts it to the kit's
++`System` interface and makes sure nothing ever raises out of a callback.
++
++Kit interface (ttbench/server.py): on_scenario_start(context),
++on_agent_start(text, duration_ms), on_agent_end(), on_frame(agent, caller)
++-> None | "STOP" | "RESUME" | "TAKE_TURN".
++"""
++from __future__ import annotations
++
++import os
++import sys
++import time
++import traceback
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++from tt.config import Config  # noqa: E402
++from tt.decider import Decider  # noqa: E402
++from tt.words import WordsWorker, shared_backend  # noqa: E402
++
++try:  # the kit provides the base class and the WebSocket runner
++    from ttbench.server import System, run  # type: ignore
++except Exception:  # pragma: no cover - lets tools/ run offline without the kit
++    run = None
++
++    class System:  # minimal stand-in
++        def on_scenario_start(self, context): ...
++
++
++TEAM = "my-team"            # TODO: real team name
++
++
++def _config_from_env() -> Config:
++    """TT_CFG="stop_after_ms=480,soft_stop=1" for scorer sweeps."""
++    cfg = Config()
++    spec = os.environ.get("TT_CFG", "").strip()
++    for item in filter(None, (s.strip() for s in spec.split(","))):
++        k, v = item.split("=", 1)
++        cfg.override(**{k.strip(): v.strip()})
++    return cfg
++
++
++class MySystem(System):
++    def __init__(self):
++        self.cfg = _config_from_env()
++        self.words = self._load_words()      # loaded once, before the first call
++        # one line for dashboards / the demo page: which layers are really running
++        self.demo_note = ("acoustics + words (Whisper tiny, offline)" if self.words is not None
++                          else "acoustics only (words layer off or ASR model missing)")
++        self.dec = Decider(self.cfg, words=self.words)
++        self.debug = bool(os.environ.get("TT_DEBUG"))
++        self._slow = 0
++
++    # ------------------------------------------------------------- callbacks
++    def _load_words(self):
++        """Offline ASR for the words layer; None (acoustics only) if unavailable."""
++        if not self.cfg.use_words:
++            return None
++        path = self.cfg.asr_model_dir
++        if not os.path.isabs(path):
++            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
++        try:
++            return WordsWorker(shared_backend(path))
++        except Exception:
++            # no model / no faster-whisper: run on acoustics alone, never crash
++            print(f"[tt] words layer disabled: cannot load ASR from {path}", file=sys.stderr)
++            return None
++
++    def on_scenario_start(self, context=None):
++        """New call: fresh echo/noise/caller-level state (one connection serves many calls)."""
++        try:
++            self.dec = Decider(self.cfg, words=self.words)
++        except Exception:
++            self._err()
++
++    def on_agent_start(self, *args, **kwargs):
++        try:
++            self.dec.agent_start(*args, **kwargs)
++        except Exception:
++            self._err()
++
++    def on_agent_end(self, *args, **kwargs):
++        try:
++            self.dec.agent_end(*args, **kwargs)
++        except Exception:
++            self._err()
++
++    def on_frame(self, agent, caller):
++        t0 = time.perf_counter()
++        try:
++            action = self.dec.frame(agent, caller)
++        except Exception:
++            self._err()
++            action = None
++        dt = time.perf_counter() - t0
++        if dt > 0.010:
++            self._slow += 1
++            if self.debug:
++                print(f"[tt] slow frame {dt*1000:.1f} ms", file=sys.stderr)
++        if action and self.debug:
++            print(f"[tt] {self.dec.log[-1]}", file=sys.stderr)
++        return action
++
++    def _err(self):
++        if getattr(self, "debug", True):
++            traceback.print_exc()
++
++
++if __name__ == "__main__":
++    run(MySystem, TEAM, __file__)
+diff --git a/demo/models/sarj_v3/tt/__init__.py b/demo/models/sarj_v3/tt/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/demo/models/sarj_v3/tt/config.py b/demo/models/sarj_v3/tt/config.py
+new file mode 100644
+index 0000000..4782bbb
+--- /dev/null
++++ b/demo/models/sarj_v3/tt/config.py
+@@ -0,0 +1,95 @@
++"""All tunable parameters in one place so the scorer sweep can override them.
++
++Times are in milliseconds, levels in dB. Defaults are first guesses: tune them
++on the dev scorer, and prefer values that also hold on the D3 checkpoint set.
++"""
++from dataclasses import dataclass, field, asdict
++
++
++@dataclass
++class Config:
++    frame_ms: float = 20.0
++
++    # ---- echo suppression (frontend) ----
++    max_echo_lag_frames: int = 15        # search echo delay 0..300 ms
++    echo_overestimate_db: float = 6.0    # subtract this much more than the estimated echo
++    echo_window_frames: int = 200        # agent-active frames used for the echo-gain estimate
++    echo_percentile: float = 60.0        # robust estimate (caller speech is the minority)
++    echo_init_db: float = -6.0           # pessimistic start: assume echo ~6 dB below agent
++
++    # ---- noise floor (frontend) ----
++    noise_rise_db_per_s: float = 3.0
++
++    # ---- frame-level speech evidence ----
++    snr_on_db: float = 9.0               # excess-over-noise needed for a speech frame
++    snr_strong_db: float = 18.0          # above this, voicing is not required
++    voicing_on: float = 0.40             # normalised autocorr peak (pitch 70-400 Hz)
++    use_silero: bool = False             # needs models/silero_vad.onnx; A/B on dev first
++    silero_on: float = 0.5
++
++    # ---- background-speech rejection ----
++    bg_below_caller_db: float = 99.0     # per-frame gate (off: the run-level soft_rel_db check does this); frames this far below the caller's own level are ignored
++    caller_ref_pct: float = 80.0         # caller level = this percentile of their speech frames
++
++    # ---- run / decision logic ----
++    hangover_ms: float = 200.0           # gap that still counts as the same run
++    leak_rate: float = 0.5               # after the hangover, accumulated speech decays at this rate (1e9 = hard reset)
++    stop_after_ms: float = 520.0         # speech needed in a run before STOP
++    loud_bonus_db: float = 4.0           # louder than caller's usual level ...
++    loud_shorten_ms: float = 120.0       # ... -> stop sooner
++    soft_rel_db: float = 0.0             # run (p80 level) below caller's level by more than this ...
++    soft_ms_per_db: float = 300.0        # ... -> need this much more speech per extra dB
++    soft_extra_ms: float = 4000.0        # cap
++    flux_low: float = 0.0                # mean spectral change below this = sustained sound (0 = off)
++    flux_extra_ms: float = 300.0
++    bc_zone_ms: float = 450.0            # after an agent phrase end, backchannels are expected
++    bc_zone_extend_ms: float = 160.0     # ... -> need more speech
++    question_zone_ms: float = 1200.0     # after an agent question mid-utterance
++    question_shorten_ms: float = 80.0
++    min_ms_after_agent_start: float = 200.0  # ignore the first frames of an agent turn
++
++    # ---- learned backchannel-vs-interruption classifier (tools/train_classifier.py) ----
++    use_clf: bool = False
++    clf_path: str = "models/bc_clf.json"
++    clf_gain_ms: float = 200.0           # p=1 -> stop 200 ms sooner, p=0 -> 200 ms later
++
++    # ---- words layer (tt/words.py) ----
++    use_words: bool = True               # falls back to acoustics only if the model is missing
++    asr_model_dir: str = "models/faster-whisper-tiny"
++    asr_min_speech_ms: float = 160.0     # transcribe once a run has this much speech
++    asr_every_ms: float = 200.0          # re-transcribe the growing run this often
++    asr_pre_ms: float = 200.0            # audio kept before the run start
++    asr_window_ms: float = 3000.0        # at most this much audio per request
++    asr_final_within_ms: float = 600.0   # after the run ends, one last request (complete word) within this gap
++    word_stop_min_ms: float = 100.0
++    word_stop_max_gap_ms: float = 1000.0 # a stop word that arrives later than this after the caller fell silent is ignored (slow CPU)
++    word_stop_soft_db: float = 6.0       # a stop word from a voice this much softer than the caller (TV, room) is ignored      # a stop word needs at least this much speech
++    keep_word_min_run_ms: float = 800.0  # only listener tokens heard -> the run must last this long
++    content_word_shorten_ms: float = 0.0
++
++    # ---- soft stop + RESUME ----
++    soft_stop: bool = False              # stop EARLY (soft_stop_after_ms), rely on RESUME
++    soft_stop_after_ms: float = 300.0
++    resume: bool = False                 # take back a stop if the caller goes quiet fast
++    resume_if_run_under_ms: float = 900.0   # only if the whole run was this short
++    resume_gap_ms: float = 140.0         # caller silence before we resume
++    resume_window_ms: float = 3000.0     # <500 ms after STOP = half credit; later still un-silences the agent
++    max_resumes: int = 3                 # per agent utterance
++    after_resume_extra_ms: float = 150.0
++
++    extra: dict = field(default_factory=dict)
++
++    def override(self, **kw):
++        for k, v in kw.items():
++            if not hasattr(self, k):
++                raise KeyError(f"unknown config key {k}")
++            cur = getattr(self, k)
++            if isinstance(cur, bool):
++                v = str(v).strip().lower() in ("1", "true", "yes", "on")
++            else:
++                v = type(cur)(float(v)) if isinstance(cur, (int, float)) else v
++            setattr(self, k, v)
++        return self
++
++    def as_dict(self):
++        return asdict(self)
+diff --git a/demo/models/sarj_v3/tt/decider.py b/demo/models/sarj_v3/tt/decider.py
+new file mode 100644
+index 0000000..33d5ae1
+--- /dev/null
++++ b/demo/models/sarj_v3/tt/decider.py
+@@ -0,0 +1,363 @@
++"""Decision logic: turns per-frame speech evidence into STOP / RESUME.
++
++Pure Python, no I/O, so it can be unit-tested and replayed offline.
++"""
++from __future__ import annotations
++
++import collections
++import re
++
++import numpy as np
++from dataclasses import dataclass, field
++from typing import List, Optional
++
++from .config import Config
++from .frontend import Frontend, FrameFeatures
++from .prefix import LinearModel, prefix_vector
++from .words import classify
++
++STOP, RESUME = "STOP", "RESUME"
++_PUNCT_END = re.compile(r"[.!?؟،,؛;:…]$")
++_QUESTION = re.compile(r"[?؟]$")
++
++
++@dataclass
++class Word:
++    text: str
++    start_ms: float
++    end_ms: float
++
++
++@dataclass
++class AgentPlan:
++    """What we know about the agent utterance from agent_utterance_start."""
++    text: str = ""
++    words: List[Word] = field(default_factory=list)
++    phrase_ends_ms: List[float] = field(default_factory=list)
++    question_ends_ms: List[float] = field(default_factory=list)
++
++
++def estimate_word_times(text: str, duration_ms: float) -> List[Word]:
++    """No word timings from the kit: spread the utterance duration over the
++    words by character count, with extra weight for punctuation pauses."""
++    toks = text.split()
++    if not toks:
++        return []
++    weights = [len(w) + (4 if _PUNCT_END.search(w) else 1) for w in toks]
++    scale = duration_ms / sum(weights)
++    out, t = [], 0.0
++    for w, wt in zip(toks, weights):
++        speak = (len(w) + 1) * scale
++        out.append(Word(w, t, t + speak))
++        t += wt * scale
++    return out
++
++
++def parse_agent_info(*args, **kwargs) -> AgentPlan:
++    """Accept whatever the kit passes at agent start (dict, object, text, words)."""
++    info = {}
++    for a in args:
++        if isinstance(a, dict):
++            info.update(a)
++        elif isinstance(a, str):
++            info.setdefault("text", a)
++        elif isinstance(a, (list, tuple)):
++            info.setdefault("words", a)
++        elif isinstance(a, (int, float)) and not isinstance(a, bool):
++            info.setdefault("duration_ms", float(a))
++        elif a is not None and hasattr(a, "__dict__"):
++            info.update(vars(a))
++    info.update(kwargs)
++    plan = AgentPlan(text=str(info.get("text") or info.get("transcript") or ""))
++    words = info.get("words") or info.get("word_timings") or info.get("timings") or []
++    for w in words:
++        try:
++            if isinstance(w, dict):
++                t = w.get("word") or w.get("text") or ""
++                s = float(w.get("start_ms", w.get("start", 0)))
++                e = float(w.get("end_ms", w.get("end", s)))
++            else:
++                t, s, e = str(w[0]), float(w[1]), float(w[2])
++        except Exception:
++            continue
++        plan.words.append(Word(t, s, e))
++    if not plan.words and plan.text and float(info.get("duration_ms") or 0) > 0:
++        plan.words = estimate_word_times(plan.text, float(info["duration_ms"]))
++    # timings in seconds? convert if the whole utterance is < 100 "units"
++    if plan.words and plan.words[-1].end_ms < 100:
++        for w in plan.words:
++            w.start_ms *= 1000.0
++            w.end_ms *= 1000.0
++    for i, w in enumerate(plan.words):
++        nxt = plan.words[i + 1] if i + 1 < len(plan.words) else None
++        gap = (nxt.start_ms - w.end_ms) if nxt else 0
++        if _PUNCT_END.search(w.text.strip()) or gap > 250:
++            plan.phrase_ends_ms.append(w.end_ms)
++        if _QUESTION.search(w.text.strip()) and nxt is not None:
++            plan.question_ends_ms.append(w.end_ms)
++    return plan
++
++
++class Decider:
++    def __init__(self, cfg: Optional[Config] = None, words=None):
++        self.cfg = cfg or Config()
++        self.words = words          # WordsWorker (tt/words.py) or None
++        self.audio = collections.deque(maxlen=int(self.cfg.asr_window_ms // self.cfg.frame_ms) + 20)
++        self.utt_seq = 0
++        self.run_seq = 0
++        self.last_submit = -1e9
++        self.fe = Frontend(self.cfg)
++        self.caller_ref_db = None   # caller's own speaking level (near-field)
++        self._ref_levels = collections.deque(maxlen=500)
++        self.log = []               # (t_ms, event, details) for failure analysis
++        self.agent_on = False
++        self.plan = AgentPlan()
++        self.prefix_sink = None     # training: list that receives (abs_ms, run_start_abs_ms, vec)
++        self.prefix_ms = 300.0
++        self.abs_t = 0.0
++        self.clf = None
++        if self.cfg.use_clf:
++            try:
++                self.clf = LinearModel(self.cfg.clf_path)
++            except Exception:
++                self.clf = None
++        self._reset_utt()
++
++    # --------------------------------------------------------------- events
++    def _reset_utt(self):
++        self.t = 0.0
++        self.stopped = False
++        self.stop_t = None
++        self.resumed = False
++        self.n_resumes = 0
++        self.run_speech = 0.0
++        self.run_gap = 1e9
++        self.run_start = None
++        self.run_levels = []
++        self.run_flux = []
++        self.last_agent_voice_t = 0.0
++        self.run_in_pause = False
++        self.run_frames = []
++        self.run_ctx = (False, False, False, 0.0)
++        self.clf_adjust = 0.0
++        self.word_verdict = None
++        self.word_text = ""
++        self.final_sent = False
++
++    def agent_start(self, *args, **kwargs):
++        self.agent_on = True
++        try:
++            self.plan = parse_agent_info(*args, **kwargs)
++        except Exception:
++            self.plan = AgentPlan()
++        self.utt_seq += 1
++        self._reset_utt()
++
++    def agent_end(self, *args, **kwargs):
++        self.agent_on = False
++        self.stopped = False
++
++    # ------------------------------------------------------------ main loop
++    def frame(self, agent, caller) -> Optional[str]:
++        cfg = self.cfg
++        f = self.fe.process(agent, caller)
++        self.t += cfg.frame_ms
++        t = self.t
++        self.abs_t += cfg.frame_ms
++        if self.words is not None:
++            self.audio.append((self.abs_t, np.asarray(caller, dtype=np.int16).copy()))
++            self._poll_words()
++
++        if not self.agent_on:
++            # the caller is the main speaker now: learn their near-field level
++            # robust: a high percentile of the caller's speech frames, so weak
++            # onsets/offsets and background talk do not pull it down
++            if f.is_speech and f.snr_db > cfg.snr_strong_db:
++                self._ref_levels.append(f.excess_db)
++                if len(self._ref_levels) >= 10:
++                    self.caller_ref_db = float(np.percentile(self._ref_levels, cfg.caller_ref_pct))
++            return None
++
++        if f.agent_db > -50:
++            self.last_agent_voice_t = t
++
++        # ---- run tracking (speech frames with short gaps tolerated) ----
++        speech = f.is_speech and t > cfg.min_ms_after_agent_start
++        if speech and self._is_background(f):
++            speech = False
++        if speech:
++            # a new run only once the previous one has fully leaked away
++            if self.run_gap > cfg.hangover_ms and self.run_speech <= 0:
++                self.run_start = t
++                self.run_speech = 0.0
++                self.run_levels = []
++                self.run_flux = []
++                self.run_in_pause = (t - self.last_agent_voice_t) > 150
++                self.run_frames = []
++                self.run_ctx = self.context(t)
++                self.clf_adjust = 0.0
++                self.run_start_abs = self.abs_t
++                self.run_seq += 1
++                self.word_verdict = None
++                self.word_text = ""
++            self.run_speech += cfg.frame_ms
++            self.run_levels.append(f.excess_db)
++            self.run_flux.append(f.flux)
++            self.run_gap = 0.0
++        else:
++            self.run_gap += cfg.frame_ms
++            if self.run_gap > cfg.hangover_ms and self.run_speech > 0:
++                # leaky accumulation: short words separated by pauses
++                # ("لا … لا … لحظة") add up; isolated sounds fade out
++                self.run_speech = max(0.0, self.run_speech - cfg.leak_rate * cfg.frame_ms)
++        if self.run_start is not None and self.run_gap <= cfg.hangover_ms:
++            self.run_frames.append(f)
++            n_ms = len(self.run_frames) * cfg.frame_ms
++            if self.clf is not None and n_ms == self.clf.prefix_ms:
++                p = self.clf.p_interrupt(prefix_vector(self.run_frames, self.caller_ref_db, *self.run_ctx))
++                self.clf_adjust = -cfg.clf_gain_ms * (2 * p - 1)
++            if self.prefix_sink is not None and n_ms == self.prefix_ms:
++                self.prefix_sink.append((self.abs_t, self.run_start_abs,
++                                         prefix_vector(self.run_frames, self.caller_ref_db, *self.run_ctx)))
++        run_ended = self.run_gap > cfg.hangover_ms
++
++        # ---- after a (soft) stop: maybe take it back ----
++        if self.stopped:
++            if (cfg.resume and self.n_resumes < cfg.max_resumes
++                    and self.run_gap >= cfg.resume_gap_ms
++                    and self.run_speech < cfg.resume_if_run_under_ms
++                    and t - self.stop_t <= cfg.resume_window_ms):
++                # the caller went quiet again quickly: it was a backchannel /
++                # noise, not a turn claim -> take the stop back
++                self.stopped = False
++                self.resumed = True
++                self.n_resumes += 1
++                self._log(t, RESUME, f)
++                return RESUME
++            return None
++
++        if self.run_start is None:
++            return None
++
++        # ---- words layer ----
++        if self.words is not None:
++            if (self.word_verdict == "stop" and self.run_speech >= cfg.word_stop_min_ms
++                    and self.run_gap <= cfg.word_stop_max_gap_ms
++                    and self._run_rel_db() >= -cfg.word_stop_soft_db):
++                # a floor-claiming word ("لا", "لحظة", "توقف"): stop now, even
++                # if the caller already fell silent while ASR was working
++                self.stopped = True
++                self.stop_t = t
++                self._log(t, STOP, f, words=self.word_text)
++                return STOP
++            if not run_ended:
++                self._submit_words()
++                self.final_sent = False
++            elif not self.final_sent and self.word_verdict is None and self.run_gap <= cfg.asr_final_within_ms:
++                # the caller just fell silent: transcribe the complete short
++                # word once ("لحظة." alone), the case acoustics cannot decide
++                self.final_sent = self._submit_words(final=True)
++
++        if run_ended:
++            return None
++
++        need = self._needed_ms(f)
++        if self.run_speech >= need:
++            self.stopped = True
++            self.stop_t = t
++            self._log(t, STOP, f, need=need)
++            return STOP
++        return None
++
++    # -------------------------------------------------------------- helpers
++    def _run_rel_db(self) -> float:
++        """Run level (80th pct) relative to the caller's own level; 0 if unknown."""
++        if not self.run_levels or self.caller_ref_db is None:
++            return 0.0
++        return float(np.percentile(self.run_levels, 80)) - self.caller_ref_db
++
++    def _submit_words(self, final: bool = False) -> bool:
++        cfg = self.cfg
++        if self.words.busy or (not final and (self.run_speech < cfg.asr_min_speech_ms
++                                              or self.abs_t - self.last_submit < cfg.asr_every_ms)):
++            return False
++        t0 = self.run_start_abs - cfg.asr_pre_ms
++        frames = [a for (ts, a) in self.audio if ts > t0]
++        if not frames:
++            return False
++        req = (id(self), self.utt_seq, self.run_seq)
++        if self.words.submit(req, np.concatenate(frames), self.abs_t,
++                             t0_ms=max(t0, self.abs_t - cfg.asr_window_ms), t1_ms=self.abs_t):
++            self.last_submit = self.abs_t
++            return True
++        return False
++
++    def _poll_words(self):
++        res = self.words.poll(self.abs_t)
++        if res is None:
++            return
++        req, text = res
++        if req != (id(self), self.utt_seq, self.run_seq):
++            return  # stale: an earlier run, utterance or call
++        v = classify(text)
++        if v is not None and not (self.word_verdict == "stop" and v != "stop"):
++            self.word_verdict, self.word_text = v, text
++
++    def context(self, t: float):
++        """(agent_pause, near_phrase_end, after_question, t_in_utt_ms) at time t."""
++        return ((t - self.last_agent_voice_t) > 150,
++                self._in_zone(t, self.plan.phrase_ends_ms, self.cfg.bc_zone_ms),
++                self._in_zone(t, self.plan.question_ends_ms, self.cfg.question_zone_ms),
++                t)
++
++    def _is_background(self, f: FrameFeatures) -> bool:
++        if self.caller_ref_db is None:
++            return False
++        return f.excess_db < self.caller_ref_db - self.cfg.bg_below_caller_db
++
++    def _needed_ms(self, f: FrameFeatures) -> float:
++        cfg = self.cfg
++        if cfg.soft_stop and not self.resumed:
++            need = cfg.soft_stop_after_ms
++        else:
++            need = cfg.stop_after_ms
++            if self.resumed:
++                need += cfg.after_resume_extra_ms  # we were wrong once this utterance
++        start = self.run_start
++        if self.run_levels and self.caller_ref_db is not None:
++            # someone claiming the floor speaks at full voice; backchannels,
++            # fillers, side talk and background are softer than the caller's
++            # own turn level
++            rel = float(np.percentile(self.run_levels, 80)) - self.caller_ref_db
++            if rel > cfg.loud_bonus_db:
++                need -= cfg.loud_shorten_ms
++            elif rel < -cfg.soft_rel_db:
++                # graded, not a cliff: every dB softer asks for more evidence
++                need += min(cfg.soft_extra_ms, cfg.soft_ms_per_db * (-rel - cfg.soft_rel_db))
++        if self.run_flux and len(self.run_flux) >= 5:
++            # little spectral change = one sustained sound (أها، اممم، هيه), a horn
++            if sum(self.run_flux) / len(self.run_flux) < cfg.flux_low:
++                need += cfg.flux_extra_ms
++        if self._in_zone(start, self.plan.phrase_ends_ms, cfg.bc_zone_ms):
++            need += cfg.bc_zone_extend_ms
++        elif not self.plan.phrase_ends_ms and self.run_in_pause:
++            # no word timings: an agent pause is the fallback "phrase end"
++            need += cfg.bc_zone_extend_ms
++        if self._in_zone(start, self.plan.question_ends_ms, cfg.question_zone_ms):
++            need -= cfg.question_shorten_ms
++        need += self.clf_adjust
++        if self.word_verdict == "keep":
++            # only listener tokens so far (نعم، أها، تمام). Arabic answers often
++            # START with one ("إيه الأحد، احجزه"), so a token cannot delay the
++            # stop forever: it only asks the run to outlast a backchannel.
++            need = max(need, cfg.keep_word_min_run_ms)
++        elif self.word_verdict == "content":
++            need -= cfg.content_word_shorten_ms
++        return max(need, 160.0)
++
++    @staticmethod
++    def _in_zone(t: float, ends: List[float], width: float) -> bool:
++        return any(0 <= t - e <= width for e in ends)
++
++    def _log(self, t, ev, f, **kw):
++        self.log.append((round(t), ev, repr(f), kw))
+diff --git a/demo/models/sarj_v3/tt/frontend.py b/demo/models/sarj_v3/tt/frontend.py
+new file mode 100644
+index 0000000..8efb6f7
+--- /dev/null
++++ b/demo/models/sarj_v3/tt/frontend.py
+@@ -0,0 +1,256 @@
++"""Per-frame audio frontend: echo suppression, noise floor, speech evidence.
++
++Everything works on telephone-band powers (100-3400 Hz) so that wideband dev
++audio and narrowband phone audio in the hidden set look the same to the
++decision logic. Cost is one small rFFT per channel per frame (<0.2 ms).
++"""
++from __future__ import annotations
++
++import collections
++import math
++import os
++
++import numpy as np
++
++from .config import Config
++
++BAND_EDGES_HZ = [100, 300, 500, 700, 900, 1150, 1400, 1700, 2000, 2400, 2800, 3400]
++EPS = 1e-12
++FLOOR = 1e-10  # ~ -100 dBFS per band
++
++
++def to_float(x) -> np.ndarray:
++    a = np.asarray(x)
++    if a.dtype.kind in "iu":
++        return a.astype(np.float32) / 32768.0
++    return a.astype(np.float32, copy=False)
++
++
++class FrameFeatures:
++    __slots__ = ("caller_db", "agent_db", "excess_db", "snr_db", "voicing",
++                 "vad_prob", "echo_frac", "is_speech", "flux")
++
++    def __repr__(self):
++        return ("FF(snr=%.1f exc=%.1f ag=%.1f voi=%.2f vad=%s echo=%.2f sp=%s)" %
++                (self.snr_db, self.excess_db, self.agent_db, self.voicing,
++                 "-" if self.vad_prob is None else "%.2f" % self.vad_prob,
++                 self.echo_frac, self.is_speech))
++
++
++class _SileroVAD:
++    """Optional Silero VAD (v5 ONNX). Disabled silently on any problem."""
++
++    def __init__(self, path: str):
++        import onnxruntime as ort  # noqa: local import, optional
++        so = ort.SessionOptions()
++        so.inter_op_num_threads = 1
++        so.intra_op_num_threads = 1
++        self.sess = ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
++        self.reset()
++        for _ in range(3):  # warm-up: first inference is slow, keep it out of on_frame
++            self.push(np.zeros(512, dtype=np.float32))
++        self.reset()
++
++    def reset(self):
++        self.state = np.zeros((2, 1, 128), dtype=np.float32)
++        self.ctx = np.zeros(64, dtype=np.float32)
++        self.buf = np.zeros(0, dtype=np.float32)
++        self.prob = 0.0
++
++    def push(self, x16k: np.ndarray) -> float:
++        self.buf = np.concatenate([self.buf, x16k])
++        while len(self.buf) >= 512:
++            chunk, self.buf = self.buf[:512], self.buf[512:]
++            inp = np.concatenate([self.ctx, chunk])[None, :].astype(np.float32)
++            out, self.state = self.sess.run(
++                None, {"input": inp, "state": self.state, "sr": np.array(16000, dtype=np.int64)})
++            self.ctx = chunk[-64:]
++            self.prob = float(out.reshape(-1)[0])
++        return self.prob
++
++
++class Frontend:
++    def __init__(self, cfg: Config, model_dir: str | None = None):
++        self.cfg = cfg
++        self.sr = None
++        self.n = None
++        self.vad = None
++        self._vad_tried = False
++        self.model_dir = model_dir or os.path.join(os.path.dirname(__file__), "..", "models")
++        self._load_vad()
++        self.reset_call()
++
++    def _load_vad(self):
++        if self._vad_tried or not self.cfg.use_silero:
++            return
++        self._vad_tried = True
++        p = os.path.join(self.model_dir, "silero_vad.onnx")
++        if os.path.exists(p):
++            try:
++                self.vad = _SileroVAD(p)
++            except Exception:
++                self.vad = None
++
++    # ------------------------------------------------------------------ setup
++    def _setup(self, n: int):
++        self.n = n
++        self.sr = int(round(n / (self.cfg.frame_ms / 1000.0)))
++        self.win = np.hanning(n).astype(np.float32)
++        freqs = np.fft.rfftfreq(n, 1.0 / self.sr)
++        edges = [e for e in BAND_EDGES_HZ if e < self.sr / 2] or [self.sr / 2]
++        self.band_idx = np.digitize(freqs, edges) - 1
++        self.nb = len(edges) - 1
++        self.valid = (freqs >= edges[0]) & (freqs < edges[-1])
++        lag_min = max(1, int(self.sr / 400))
++        lag_max = int(self.sr / 70)
++        self.lag_rng = (lag_min, lag_max)
++        L = self.cfg.max_echo_lag_frames + 2
++        self.agent_hist = collections.deque([np.full(self.nb, FLOOR)] * L, maxlen=L)
++        self._reset_echo()
++        self.noise = np.full(self.nb, FLOOR * 10)
++        self.prev_caller = np.zeros(n, dtype=np.float32)
++        self.prev_shape = None
++        self._rise_noise = 10 ** (self.cfg.noise_rise_db_per_s * self.cfg.frame_ms / 1000 / 10)
++
++    def _reset_echo(self):
++        self.H = np.full(self.nb, 10 ** (self.cfg.echo_init_db / 10))
++        self.ratio_hist = collections.deque(maxlen=self.cfg.echo_window_frames)
++        self.pc_s = collections.deque(maxlen=3)
++        self.ref_s = collections.deque(maxlen=3)
++
++    def reset_call(self):
++        self.lag = None
++        self.env_a = collections.deque(maxlen=150)
++        self.env_c = collections.deque(maxlen=150)
++        self.frame_no = 0
++        if self.n is not None:
++            self._setup(self.n)
++
++    # ---------------------------------------------------------------- helpers
++    def _bands(self, x: np.ndarray) -> np.ndarray:
++        spec = np.fft.rfft(x * self.win)
++        p = (spec.real ** 2 + spec.imag ** 2) / (self.n * self.n)
++        out = np.bincount(self.band_idx[self.valid], weights=p[self.valid], minlength=self.nb)
++        return np.maximum(out[: self.nb], FLOOR)
++
++    def _voicing(self, x: np.ndarray) -> float:
++        seg = np.concatenate([self.prev_caller, x])
++        seg = seg - seg.mean()
++        e = float(np.dot(seg, seg))
++        if e < 1e-9:
++            return 0.0
++        m = len(seg)
++        f = np.fft.rfft(seg, 2 * m)
++        ac = np.fft.irfft(f.real ** 2 + f.imag ** 2)[:m]
++        lo, hi = self.lag_rng
++        hi = min(hi, m - 1)
++        # normalise by overlap length so long lags are not penalised
++        norm = ac[lo:hi] / (ac[0] + EPS) * (m / (m - np.arange(lo, hi)))
++        return float(np.clip(norm.max(), 0.0, 1.0))
++
++    def _update_lag(self):
++        if len(self.env_a) < 100:
++            return
++        a = np.array(self.env_a)
++        c = np.array(self.env_c)
++        if a.std() < 3.0:  # agent not modulated enough to estimate a delay
++            return
++        best, best_k = -1.0, None
++        K = self.cfg.max_echo_lag_frames
++        for k in range(K + 1):
++            aa = a[: len(a) - k]
++            cc = c[k:]
++            if aa.std() < 1e-6 or cc.std() < 1e-6:
++                continue
++            r = float(np.corrcoef(aa, cc)[0, 1])
++            if r > best:
++                best, best_k = r, k
++        if best > 0.5 and best_k != self.lag:
++            # the echo-gain estimate was calibrated against another reference
++            self.lag = best_k
++            self._reset_echo()
++
++    # ------------------------------------------------------------------- main
++    def process(self, agent, caller) -> FrameFeatures:
++        a = to_float(agent).reshape(-1)
++        c = to_float(caller).reshape(-1)
++        if self.n != len(c):
++            self._setup(len(c))
++        self.frame_no += 1
++        cfg = self.cfg
++
++        Pa = self._bands(a) if len(a) == self.n else np.full(self.nb, FLOOR)
++        Pc = self._bands(c)
++        self.agent_hist.appendleft(Pa)
++        agent_db = 10 * math.log10(Pa.sum())
++        caller_db = 10 * math.log10(Pc.sum())
++        self.env_a.append(agent_db)
++        self.env_c.append(caller_db)
++        if self.frame_no % 25 == 0:
++            self._update_lag()
++
++        # noise floor of the raw caller channel (minimum statistics: fast down,
++        # slow up). Stationary noise must not be mistaken for echo below.
++        down = Pc < self.noise
++        self.noise = np.where(down, 0.8 * self.noise + 0.2 * Pc, self.noise * self._rise_noise)
++        self.noise = np.maximum(self.noise, FLOOR)
++
++        # echo reference: agent power at the estimated delay (+-1 frame smear),
++        # or the max over all plausible delays while the delay is unknown.
++        hist = list(self.agent_hist)
++        if self.lag is None:
++            ref = np.max(hist[: cfg.max_echo_lag_frames + 1], axis=0)
++        else:
++            lo = max(0, self.lag - 1)
++            ref = np.max(hist[lo: self.lag + 2], axis=0)
++
++        # echo-path gain per band = median log-ratio caller/agent-ref over the
++        # last few seconds of agent speech, on 3-frame smoothed powers. The
++        # median ignores the minority of frames where the caller talks too.
++        self.pc_s.append(Pc)
++        self.ref_s.append(ref)
++        pc3 = np.mean(self.pc_s, axis=0)
++        ref3 = np.mean(self.ref_s, axis=0)
++        agent_active = ref3.sum() > 1e-7
++        if agent_active:
++            self.ratio_hist.append(np.log10(np.maximum(pc3 - self.noise, FLOOR) / ref3))
++            if len(self.ratio_hist) >= 25 and self.frame_no % 5 == 0:
++                med = np.percentile(np.array(self.ratio_hist), cfg.echo_percentile, axis=0)
++                self.H = np.clip(10 ** med, 1e-7, 4.0)
++
++        over = 10 ** (cfg.echo_overestimate_db / 10)
++        echo_est = self.H * np.maximum(ref, ref3)
++        excess = np.maximum(Pc - over * echo_est, 0.0)
++        echo_frac = float(min(1.0, echo_est.sum() / Pc.sum()))
++
++        ex_sum = float(excess.sum())
++        f = FrameFeatures()
++        f.caller_db = caller_db
++        f.agent_db = agent_db
++        f.excess_db = 10 * math.log10(ex_sum + FLOOR)
++        f.snr_db = 10 * math.log10((ex_sum + EPS) / self.noise.sum())
++        f.voicing = self._voicing(c)
++        f.echo_frac = echo_frac
++        # spectral change vs previous frame (articulation: consonants, vowel
++        # changes). Level-normalised log spectrum, only bands above noise.
++        shape = 10 * np.log10(np.maximum(excess, self.noise))
++        shape = shape - shape.mean()
++        f.flux = 0.0 if self.prev_shape is None else float(np.mean(np.abs(shape - self.prev_shape)))
++        self.prev_shape = shape
++        self.prev_caller = c
++
++        f.vad_prob = None
++        if self.vad is not None:
++            try:
++                x16 = c if self.sr == 16000 else np.interp(
++                    np.arange(0, len(c), self.sr / 16000), np.arange(len(c)), c).astype(np.float32)
++                f.vad_prob = self.vad.push(x16)
++            except Exception:
++                self.vad = None
++
++        speech = f.snr_db > cfg.snr_on_db and (f.voicing > cfg.voicing_on or f.snr_db > cfg.snr_strong_db)
++        if f.vad_prob is not None:
++            # VAD confirms "is it speech"; our SNR term confirms "is it NOT echo"
++            speech = f.snr_db > cfg.snr_on_db and f.vad_prob > cfg.silero_on
++        f.is_speech = bool(speech)
++        return f
+diff --git a/demo/models/sarj_v3/tt/prefix.py b/demo/models/sarj_v3/tt/prefix.py
+new file mode 100644
+index 0000000..357f078
+--- /dev/null
++++ b/demo/models/sarj_v3/tt/prefix.py
+@@ -0,0 +1,68 @@
++"""Prefix features: describe the first N ms of a caller speech run.
++
++Used identically at training time (tools/train_classifier.py) and at runtime
++(Decider), so the classifier sees exactly what the live system sees. Only
++cheap scalar features here; embedding-based models go behind the same API.
++"""
++from __future__ import annotations
++
++import json
++import math
++from typing import List, Optional
++
++import numpy as np
++
++FEATURE_NAMES = [
++    "speech_ratio",       # share of frames flagged speech since onset
++    "snr_mean", "snr_max",
++    "level_rel_caller",   # excess level minus caller's own level (BG/BC are softer)
++    "voicing_mean",
++    "level_slope",        # dB per 100 ms (BC fade quickly, interruptions build up)
++    "echo_frac_mean",
++    "agent_level_mean",   # agent speaking loudly over it, or pausing?
++    "agent_pause_at_onset",
++    "near_phrase_end",    # onset within 450 ms after an agent phrase end
++    "after_question",     # onset within 1.2 s after an agent question
++    "t_in_utt_s",         # how far into the agent utterance
++]
++
++
++def prefix_vector(frames, caller_ref_db: Optional[float], agent_pause: bool,
++                  near_phrase_end: bool, after_question: bool, t_in_utt_ms: float) -> np.ndarray:
++    """frames: list of FrameFeatures from run onset onwards."""
++    if not frames:
++        return np.zeros(len(FEATURE_NAMES), dtype=np.float32)
++    snr = np.array([f.snr_db for f in frames])
++    exc = np.array([f.excess_db for f in frames])
++    sp = np.array([f.is_speech for f in frames], dtype=float)
++    voi = np.array([f.voicing for f in frames])
++    ech = np.array([f.echo_frac for f in frames])
++    ag = np.array([f.agent_db for f in frames])
++    ref = caller_ref_db if caller_ref_db is not None else float(np.median(exc[sp > 0])) if sp.any() else -40.0
++    lvl = float(np.mean(exc[sp > 0])) if sp.any() else float(exc.mean())
++    if len(exc) >= 3:
++        slope = float(np.polyfit(np.arange(len(exc)) * 0.2, exc, 1)[0])  # dB per 100 ms
++    else:
++        slope = 0.0
++    v = [sp.mean(), snr.mean(), snr.max(), lvl - ref, voi.mean(), slope, ech.mean(),
++         max(ag.mean(), -90.0), float(agent_pause), float(near_phrase_end),
++         float(after_question), t_in_utt_ms / 1000.0]
++    return np.nan_to_num(np.array(v, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
++
++
++class LinearModel:
++    """Standardised logistic regression stored as JSON (numpy-only at runtime)."""
++
++    def __init__(self, path: str):
++        with open(path, encoding="utf-8") as f:
++            d = json.load(f)
++        assert d["features"] == FEATURE_NAMES, "feature set changed: retrain"
++        self.prefix_ms = float(d["prefix_ms"])
++        self.mu = np.array(d["mean"])
++        self.sd = np.array(d["std"])
++        self.w = np.array(d["coef"])
++        self.b = float(d["intercept"])
++
++    def p_interrupt(self, x: np.ndarray) -> float:
++        z = float(np.dot((x - self.mu) / self.sd, self.w) + self.b)
++        return 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, z))))
+diff --git a/demo/models/sarj_v3/tt/words.py b/demo/models/sarj_v3/tt/words.py
+new file mode 100644
+index 0000000..d0c1947
+--- /dev/null
++++ b/demo/models/sarj_v3/tt/words.py
+@@ -0,0 +1,196 @@
++"""Words layer: what the caller SAID, from streaming ASR, as a STOP / KEEP cue.
++
++Acoustics cannot tell a one-word command ("توقف", "لا") from a one-word
++acknowledgement ("نعم", "أها"): same length, same level. The words can.
++
++    lexicon   classify(text) -> "stop" | "keep" | "content" | None
++    worker    WordsWorker: runs an ASR backend off the audio thread; results
++              carry the request id so stale ones (old run/utterance) are dropped
++    backends  FasterWhisperBackend (offline CPU, MIT), or any object with
++              transcribe(int16 audio @16 kHz) -> str
++
++Nothing here blocks on_frame. In offline evaluation (`sync=True`) the backend
++runs inline and its result is released only after `latency_ms` of stream
++time, so replay scores include the ASR delay.
++"""
++from __future__ import annotations
++
++import queue
++import re
++import threading
++import time
++import weakref
++from typing import Optional
++
++import numpy as np
++
++# ------------------------------------------------------------------ lexicon
++_DIACRITICS = re.compile(r"[ؐ-ًؚ-ٰٟۖ-ۭـ]")
++_NON_LETTER = re.compile(r"[^ء-يa-z0-9 ]+")
++
++
++def normalize(text: str) -> str:
++    t = _DIACRITICS.sub("", text.lower())
++    t = re.sub("[إأآٱ]", "ا", t)
++    t = t.replace("ى", "ي").replace("ة", "ه").replace("ؤ", "و").replace("ئ", "ي")
++    t = _NON_LETTER.sub(" ", t)
++    t = re.sub(r"(.)\1{2,}", r"\1\1", t)          # "اممممم" -> "امم"
++    return " ".join(t.split())
++
++
++# Words that claim the floor: objection, stop, wait, correction (Gulf/Najdi/Hijazi + MSA)
++STOP_WORDS = {
++    "لا", "لاء", "لالا", "توقف", "وقف", "قف", "اوقف", "لحظه", "لحظة", "دقيقه", "ثانيه", "استنى", "استني", "انتظر",
++    "اصبر", "بس", "لاحظه", "اسمع", "اسمعني", "اسمعيني", "الغ", "الغي", "الغاء", "كنسل", "سوري", "عفوا", "مو", "مب", "ماابي",
++    "مابي", "ماابغى", "مابغى", "غلط", "خطا", "ثواني", "يكفي", "خلاص", "stop", "no", "wait", "cancel",
++}
++# Listener tokens: acknowledge and hand the floor back
++KEEP_WORDS = {
++    "نعم", "ايه", "ايوه", "اي", "اها", "اه", "هيه", "هيه", "ام", "امم", "مم", "ممم", "تمام", "صح", "طيب", "موافق",
++    "اوكي", "اوك", "زين", "حلو", "ماشي", "اكيد", "يب", "يس", "اهاا", "معك", "معاك", "معايا", "فاهم", "فاهمه",
++    "مزبوط", "صحيح", "الله", "يعطيك", "العافيه", "تفضل", "تفضلي", "هلا", "ok", "yes", "yeah", "mhm",
++}
++# Multi-word stop phrases (checked on the normalised string)
++STOP_PHRASES = ("ما ابي", "ما ابغى", "مو كذا", "مب كذا", "ثانيه بس", "خلني اقول", "بقول لك", "عندي سوال")
++
++
++def _edit1(a: str, b: str) -> bool:
++    """True if a and b differ by at most one insert/delete/substitute."""
++    if abs(len(a) - len(b)) > 1:
++        return False
++    if len(a) > len(b):
++        a, b = b, a
++    i = 0
++    while i < len(a) and a[i] == b[i]:
++        i += 1
++    return a[i + (len(a) == len(b)):] == b[i + 1:]
++
++
++# only distinctive command words get fuzzy matching ("ماشي" must not become "مابي")
++_FUZZY_STOP = ["لحظه", "توقف", "اوقف", "دقيقه", "استنى", "استني", "انتظر", "اسمع", "اسمعني", "الغاء", "ثانيه",
++               "ثواني", "كنسل", "اصبر"]
++
++
++def _is_stop(w: str) -> bool:
++    # ASR slips on longer words ("لاحظه" for "لحظه"): allow one edit there;
++    # short words (لا، بس، مو) must match exactly
++    return w in STOP_WORDS or (len(w) >= 4 and w not in KEEP_WORDS and any(_edit1(w, s) for s in _FUZZY_STOP))
++
++
++def classify(text: str) -> Optional[str]:
++    """'stop' if any floor-claiming word, 'keep' if only listener tokens,
++    'content' for other speech (>= 2 words), None if nothing usable."""
++    t = normalize(text)
++    if not t:
++        return None
++    if any(p in t for p in STOP_PHRASES):
++        return "stop"
++    toks = t.split()
++    if any(_is_stop(w) for w in toks):
++        return "stop"
++    other = [w for w in toks if w not in KEEP_WORDS]
++    if not other:
++        return "keep"
++    return "content" if len(other) >= 2 else None
++
++
++# ------------------------------------------------------------------ backends
++class FasterWhisperBackend:
++    """Offline Whisper on CPU via CTranslate2 (pip install faster-whisper).
++    model_dir: a local CTranslate2 Whisper model (e.g. faster-whisper-base)."""
++
++    def __init__(self, model_dir: str, threads: int = 2):
++        from faster_whisper import WhisperModel  # optional dependency
++        self.model = WhisperModel(model_dir, device="cpu", compute_type="int8", cpu_threads=threads)
++        self.transcribe(np.zeros(16000, dtype=np.int16))  # warm-up before the call starts
++
++    def transcribe(self, audio: np.ndarray, **_ctx) -> str:
++        x = audio.astype(np.float32) / 32768.0
++        # no initial_prompt: Whisper copies prompt words into the output on
++        # short clips (a "stop" word out of thin air). Short output cap: the
++        # cues are in the first few words, and it stops repetition loops.
++        segs, _ = self.model.transcribe(
++            x, language="ar", beam_size=1, best_of=1, temperature=0.0, condition_on_previous_text=False,
++            without_timestamps=True, vad_filter=False, no_speech_threshold=0.6, max_new_tokens=12)
++        return " ".join(s.text for s in segs if s.no_speech_prob < 0.6).strip()
++
++
++# ------------------------------------------------------------------ worker
++_BACKENDS: dict = {}
++_BACKENDS_LOCK = threading.Lock()
++
++
++def shared_backend(model_dir: str, threads: int = 2) -> "FasterWhisperBackend":
++    """One loaded model per process, shared by every MySystem instance (a
++    server that creates a system per call must not reload Whisper each time)."""
++    key = (model_dir, threads)
++    with _BACKENDS_LOCK:
++        if key not in _BACKENDS:
++            _BACKENDS[key] = FasterWhisperBackend(model_dir, threads=threads)
++        return _BACKENDS[key]
++
++
++def _serve(q: "queue.Queue", backend, ready: list, lock: threading.Lock, owner: "weakref.ref"):
++    """Worker thread. Holds no reference to the WordsWorker itself, so the
++    thread ends shortly after its owner (one call / one demo session) is gone."""
++    while owner() is not None:
++        try:
++            req_id, audio = q.get(timeout=2.0)
++        except queue.Empty:
++            continue
++        try:
++            text = backend.transcribe(audio)
++        except Exception:
++            text = ""
++        with lock:
++            ready.append((0.0, req_id, text))
++
++
++class WordsWorker:
++    """One request in flight at a time; newest result wins.
++
++    submit(req_id, audio, now_ms) -> bool (False if busy)
++    poll(now_ms) -> (req_id, text) or None
++    """
++
++    def __init__(self, backend, sync: bool = False, latency_ms: Optional[float] = None):
++        self.backend = backend
++        self.sync = sync
++        self.latency_ms = latency_ms      # sync mode: fixed simulated delay (None = measured compute time)
++        self._busy = False
++        self._ready = []                  # (release_ms, req_id, text)
++        self._lock = threading.Lock()
++        if not sync:
++            self._q: "queue.Queue" = queue.Queue(maxsize=1)
++            threading.Thread(target=_serve, args=(self._q, backend, self._ready, self._lock, weakref.ref(self)),
++                             daemon=True).start()
++
++    @property
++    def busy(self) -> bool:
++        return self._busy
++
++    def submit(self, req_id, audio: np.ndarray, now_ms: float, **ctx) -> bool:
++        if self._busy:
++            return False
++        self._busy = True
++        if self.sync:
++            t0 = time.perf_counter()
++            try:
++                text = self.backend.transcribe(audio, now_ms=now_ms, **ctx)
++            except Exception:
++                text = ""
++            dt = (time.perf_counter() - t0) * 1000 if self.latency_ms is None else self.latency_ms
++            self._ready.append((now_ms + dt, req_id, text))
++        else:
++            self._q.put((req_id, audio))
++        return True
++
++    def poll(self, now_ms: float):
++        with self._lock:
++            due = [r for r in self._ready if r[0] <= now_ms]
++            if not due:
++                return None
++            self._ready[:] = [r for r in self._ready if r[0] > now_ms]
++        self._busy = False
++        _, req_id, text = due[-1]
++        return req_id, text
+diff --git a/demo/requirements-public.txt b/demo/requirements-public.txt
+index d006076..db2d092 100644
+--- a/demo/requirements-public.txt
++++ b/demo/requirements-public.txt
+@@ -6,3 +6,5 @@ onnxruntime==1.29.0
+ flatbuffers==25.12.19
+ packaging==26.3
+ protobuf==7.36.2
++# SARJ v3 words layer: Whisper tiny on CPU (CTranslate2, int8). MIT licences (faster-whisper, CTranslate2, Whisper).
++faster-whisper==1.2.1
+diff --git a/demo/server.py b/demo/server.py
+index 4067850..4cdaa7f 100644
+--- a/demo/server.py
++++ b/demo/server.py
+@@ -8,8 +8,9 @@ Local (presenter laptop, competition dev calls, 127.0.0.1 only):
+ Public (hosted site, see demo/DEPLOY.md):
+     python demo/server.py --public             # 0.0.0.0:$PORT, publicly licensed collections only, limits on
+ 
+-Two detectors, pinned by file hash so a label can never run other code: Baseline (the kit's starter detector,
+-bd2a3f0) and P3 Hybrid (Silero VAD + caller-relative loudness, Phase 3 commit b32cfc2). The demo shows the 24 original
++Three detectors, pinned by file hash so a label can never run other code: Baseline (the kit's starter detector,
++bd2a3f0), P3 Hybrid (Silero VAD + caller-relative loudness, Phase 3 commit b32cfc2) and SARJ v3 (acoustics + Arabic
++words layer, demo/models/sarj_v3, every file pinned). The demo shows the 24 original
+ competition recordings (data/dev), publicly since the competition supervisor's written permission (2026-11-17,
+ recorded in demo/collections.json); public mode serves a collection only with such a record and never starts with
+ no playable scenario (demo/DEPLOY.md). The 50 Phase 3 research scenarios stay in the repository, not in the demo.
+@@ -87,9 +88,24 @@ SECURITY_HEADERS = {
+ # only ever run the audited P3 code, and "Baseline" only the original starter detector.
+ P3_SHA256 = "8066ae363967adebb61e4bb9841d816b1d7b130bda837c66c826c5be1ef9d4bf"        # b32cfc2 (= 6b4eece)
+ BASELINE_SHA256 = "85a8fa0ca7c6e0f92a01fb929877cf0eff36cb0d53749cceaeaf9b6de97fd830"  # bd2a3f0 (= kit 0915ace)
++# SARJ v3 (leenalotaibi-source/sarj, branch claude/sarj-turn-taking-system-xwvrh0): my_system.py plus its tt/ package,
++# every file pinned. Words layer: faster-whisper tiny, loaded from demo/models/sarj_v3/models/faster-whisper-tiny
++# (downloaded at image build, see demo/Dockerfile); without it the detector runs on acoustics alone and says so.
++V3_SHA256 = "09e5b65a117895dc15ce75a700cb48e313cd121c7ac1738559e320606cfcd1b8"
++V3_FILES = {
++    "demo/models/sarj_v3/tt/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
++    "demo/models/sarj_v3/tt/config.py": "6dfbbe3fe26e2502287545dd6a53b51f96069da1fa3e4266cf4107252b599778",
++    "demo/models/sarj_v3/tt/decider.py": "5e59028e2225717d48e115f077b470fd07057794241a25fb91f71cf6e6567a80",
++    "demo/models/sarj_v3/tt/frontend.py": "85a3b2715c1c12d3c4b183e8a99515d1a30a10a596eb6e43a18ac5f86cae22b7",
++    "demo/models/sarj_v3/tt/prefix.py": "1559dd15e907b006132f76e3365a51632a6f65acaf32ceff3c49076eabe3daa8",
++    "demo/models/sarj_v3/tt/words.py": "c77aaf471db0676c9c6653ae5e06b646bfd46dd61a59330c22dadde417b70785",
++}
+ DEFAULT_MODELS = {
+     "p3": {"source": "file:my_system.py", "sha256": P3_SHA256, "name": "P3 Hybrid", "revision": "b32cfc2",
+            "about": "Phase 3: Silero VAD speech frames + caller-relative loudness (experimental)"},
++    "v3": {"source": "file:demo/models/sarj_v3/my_system.py", "sha256": V3_SHA256, "files": V3_FILES,
++           "name": "SARJ v3", "revision": "18471a8",
++           "about": "Echo-aware acoustics, caller-relative level, leaky speech evidence + Arabic stop/keep words"},
+     "baseline": {"source": "file:demo/models/baseline_bd2a3f0.py", "sha256": BASELINE_SHA256, "name": "Baseline",
+                  "revision": "bd2a3f0", "about": "The kit's starter detector: any caller sound for 200 ms stops the agent"},
+ }
+@@ -137,7 +153,7 @@ class Settings:
+     port: int = DEFAULT_PORT
+     collections: tuple = ("dev",)       # keys in demo/collections.json: the demo shows the 24 competition recordings only
+     data_dir: Path | None = None        # instead of collections: one folder (tests, ad-hoc local use)
+-    max_sessions: int = 16              # detector sessions held in memory (each playback runs two: Baseline and P3)
++    max_sessions: int = 24              # detector sessions held in memory (each playback runs three: Baseline, P3, v3)
+     evict_idle_s: float = 0.0           # at capacity, an older session may be dropped once idle this long
+     session_idle_s: float = 3600.0      # sessions idle longer than this are dropped
+     lookahead_ms: int = 0               # feed the detector this far ahead of playback (hides network delay)
+@@ -208,8 +224,9 @@ class Model:
+             spec = source
+             source, sha256 = spec["source"], spec.get("sha256", sha256)
+             name, self.about, pinned_rev = spec.get("name", name), spec.get("about", ""), spec.get("revision")
++            extra_files = spec.get("files", {})
+         else:
+-            self.about, pinned_rev = "", None
++            self.about, pinned_rev, extra_files = "", None, {}
+         self.id, self.source, self.pinned = model_id, source, sha256
+         self.available, self.error = False, None
+         self.revision, self.dirty, self.name, self.sha256 = None, False, name or model_id, None
+@@ -220,12 +237,19 @@ class Model:
+             if sha256 and self.sha256 != sha256:
+                 raise RuntimeError(f"{source} is not the pinned {self.name} file (sha256 {self.sha256[:12]}…, "
+                                    f"expected {sha256[:12]}…)")
++            for rel, want in extra_files.items():     # a multi-file detector: every module it imports is pinned too
++                got = hashlib.sha256((KIT / rel).read_bytes()).hexdigest()
++                if got != want:
++                    raise RuntimeError(f"{rel} is not the pinned {self.name} file (sha256 {got[:12]}…, expected {want[:12]}…)")
+             code = raw.decode("utf-8")
+             module = types.ModuleType(f"sarj_demo_model_{re.sub(r'[^0-9A-Za-z_]', '_', model_id)}")
+             module.__file__ = origin
+             exec(compile(code, origin, "exec"), module.__dict__)  # noqa: S102 - our own repository's system file
+             self._cls = module.MySystem
+-            self._cls()                     # load any model (P3: the Silero ONNX session) now, not mid-demo
++            first = self._cls()             # load any model (P3: the Silero ONNX session) now, not mid-demo
++            note = getattr(first, "demo_note", "")
++            if note:                        # e.g. SARJ v3 reports whether its words layer really loaded
++                self.about = f"{self.about} ({note})" if self.about else note
+             self.available = True
+         except Exception as e:  # noqa: BLE001 - shown in the page instead of crashing the demo
+             self.error = f"{type(e).__name__}: {e}"
+diff --git a/demo/static/app.js b/demo/static/app.js
+index e39ef28..8d98111 100644
+--- a/demo/static/app.js
++++ b/demo/static/app.js
+@@ -1,22 +1,24 @@
+ "use strict";
+-// SARJ demo page: Baseline vs P3 on the same audio.
++// SARJ demo page: Baseline vs P3 vs SARJ v3 on the same audio (v3 is shown only when the server has it).
+ // The audio clock (one AudioContext for both channels) is the master: its playhead decides which 20 ms frames the
+ // server feeds to BOTH real detectors (each in its own session; plus a small look-ahead on the hosted site, to absorb
+ // network delay). Decisions come back from the server and are applied when playback reaches the frame time at which
+ // the detector issued them. The selected detector's STOP silences the agent you hear. Nothing is pre-scripted.
+ 
+ const $ = (id) => document.getElementById(id);
+-const DETS = ["baseline", "p3"];                   // display order: left, right
+-const NAMES = { baseline: "Baseline", p3: "P3" };
++let DETS = ["baseline", "p3", "v3"];               // display order, left to right; init() drops unavailable optional ones
++const NAMES = { baseline: "Baseline", p3: "P3", v3: "SARJ v3" };
++const REQUIRED = ["baseline", "p3"];               // the page refuses to run without these two (as before)
+ 
+ const freshDet = () => ({ session: null, fedMs: 0, done: false, decisions: [], pending: [], score: null,
+   meanOnFrameUs: null, streamEndMs: 0 });
++const freshDets = () => Object.fromEntries(DETS.map((id) => [id, freshDet()]));
+ 
+ const S = {
+   config: null, models: {}, listen: "p3", scenId: null, timeline: null, audio: null,
+   ctx: null, nodes: null, sources: null, t0: 0, started: false, playing: false, ended: false,
+   gen: 0, loopGen: null, busy: false, staticLayer: null, verdictKey: "", agentMuted: false,
+-  det: { baseline: freshDet(), p3: freshDet() }, rtts: [], lookahead: 0, pollMs: 15,
++  det: freshDets(), rtts: [], lookahead: 0, pollMs: 15,
+ };
+ 
+ // ------------------------------------------------------------------------------------------------ helpers
+@@ -145,14 +147,14 @@ async function newSessions() {
+   stopSources();
+   for (const id of DETS) closeSession(S.det[id].session);
+   Object.assign(S, { started: false, playing: false, ended: false, agentMuted: false, rtts: [], verdictKey: "",
+-    det: { baseline: freshDet(), p3: freshDet() } });
++    det: freshDets() });
+   if (S.nodes) S.nodes.agent.gain.gain.value = 1;
+   $("log").innerHTML = "";
+   renderEvents(); renderTiming(); updatePlayButton();
+   const rs = await Promise.all(DETS.map((id) => api("/api/session", { scenario: S.scenId, model: id })));
+   if (gen !== S.gen) { rs.forEach((r) => closeSession(r.session_id)); return; }
+   DETS.forEach((id, i) => { S.det[id].session = rs[i].session_id; S.det[id].streamEndMs = rs[i].stream_end_ms; });
+-  addLog(0, "info", `Fresh detectors: ${rs.map((r) => `${esc(r.model.name)} @ ${esc(r.model.revision || "?")}`).join(" and ")}`, "ctl");
++  addLog(0, "info", `Fresh detectors: ${rs.map((r) => `${esc(r.model.name)} @ ${esc(r.model.revision || "?")}`).join(", ")}`, "ctl");
+   updatePlayButton();
+ }
+ 
+@@ -308,7 +310,7 @@ async function loadScenario(id) {
+ }
+ 
+ function changeListen(id) {
+-  // Both detectors keep running: this only chooses whose STOP silences the agent you hear.
++  // All detectors keep running: this only chooses whose STOP silences the agent you hear.
+   S.listen = id;
+   renderModelChip();
+   S.agentMuted = null;                            // unknown: the next updateMute() always applies the new detector's state
+@@ -464,7 +466,7 @@ function renderScenarioCard() {
+   const cr = S.timeline.credits || [];
+   $("scen-credits").textContent = cr.length ? `Audio: ${cr.map((c) => `${c.attribution} (${c.license})`).join(" · ")}` : "";
+   const gt = S.timeline.ground_truth;
+-  $("scenario-info").innerHTML = own ? "Your own audio: no ground-truth labels, so there is no official verdict. Compare the two detectors' decisions."
++  $("scenario-info").innerHTML = own ? "Your own audio: no ground-truth labels, so there is no official verdict. Compare the detectors' decisions."
+     : `<b>${esc(s.id)}</b> · ${esc(s.category_name)} · ${esc(gt.subtype)} · ${esc(s.acoustic.join(" + "))} · labels: ${esc(gt.label_status)}`;
+   if (!own) {                                       // default start of an uploaded caller file: 1 s into the agent's longest turn
+     const u = [...S.timeline.protocol.agent_utterances].sort((a, b) => (b.end_ms - b.start_ms) - (a.end_ms - a.start_ms))[0];
+@@ -533,7 +535,7 @@ async function submitOwnAudio(samples16k, offsetMs, how) {
+   S.own = { id: data.scenario_id, collection: "custom", agent_from: data.agent_from, acoustic: [], category_name: "Your own audio",
+     title: `Your audio with the agent of ${data.agent_from}`, expected: [],
+     explanation: `${how}: ${sec1(data.caller_ms)} s of your audio as the caller, starting at ${sec1(data.offset_ms)} s; the agent is the ` +
+-      `original agent of ${data.agent_from}. No labels: compare what Baseline and P3 decide. Not stored; deleted within ` +
++      `original agent of ${data.agent_from}. No labels: compare what the detectors decide. Not stored; deleted within ` +
+       `${Math.round(((S.config.custom && S.config.custom.ttl_s) || 900) / 60)} minutes.` };
+   let opt = $("scenario").querySelector("option[data-own]");
+   if (!opt) {
+@@ -548,7 +550,7 @@ async function submitOwnAudio(samples16k, offsetMs, how) {
+   opt.textContent = `Your audio · agent of ${data.agent_from}`;
+   $("scenario").value = S.own.id;
+   await loadScenario(S.own.id);
+-  ownStatus("Ready: press Play to hear your audio with the agent and see both detectors' decisions.");
++  ownStatus("Ready: press Play to hear your audio with the agent and see every detector's decisions.");
+ }
+ 
+ async function uploadOwn(file) {
+@@ -667,21 +669,23 @@ function headline() {
+   if (!S.timeline) return null;
+   const evs = S.timeline.ground_truth.events;
+   const out = [];
++  const list = (ids) => ids.map((id) => NAMES[id]).join(", ").replace(/, ([^,]*)$/, " and $1");
+   evs.forEach((ev, i) => {
+-    const b = S.det.baseline.score && S.det.baseline.score.events[i], p = S.det.p3.score && S.det.p3.score.events[i];
+-    if (!shown(b) || !shown(p) || ev.kind !== "interruption") return;
++    const res = Object.fromEntries(DETS.map((id) => [id, S.det[id].score && S.det[id].score.events[i]]));
++    if (DETS.some((id) => !shown(res[id])) || ev.kind !== "interruption") return;
+     const ok = (r) => (r.credit ?? 0) >= 1;
++    const mine = res[S.listen];                    // the detector you hear decides the colour of the line
+     if (ev.expected === "KEEP") {
+-      if (!ok(b) && ok(p)) out.push(["good", "Baseline stopped falsely; P3 correctly kept talking."]);
+-      else if (ok(b) && ok(p)) out.push(["good", "Both correctly kept talking."]);
+-      else if (!ok(b) && !ok(p)) out.push(["bad", "Both stopped falsely: the agent should have kept talking."]);
+-      else out.push(["bad", "P3 stopped falsely; Baseline kept talking."]);
++      const good = DETS.filter((id) => ok(res[id])), bad = DETS.filter((id) => !ok(res[id]));
++      if (!bad.length) out.push(["good", `All ${DETS.length} correctly kept talking.`]);
++      else if (!good.length) out.push(["bad", `All ${DETS.length} stopped falsely: the agent should have kept talking.`]);
++      else out.push([ok(mine) ? "good" : "bad", `${list(bad)} stopped falsely; ${list(good)} correctly kept talking.`]);
+     } else if (ev.expected === "STOP") {
+-      const pt = p.outcome === "yield" ? `P3 detected it ${Math.round(p.latency_ms || 0)} ms after the intent was evident` : "P3 missed it";
+-      const bt = b.outcome === "yield" ? `Baseline ${Math.round(b.latency_ms || 0)} ms` : "Baseline missed it";
+-      out.push([p.outcome === "yield" ? "good" : "bad", `Genuine interruption: ${pt} (${bt}).`]);
++      const parts = DETS.map((id) => (res[id].outcome === "yield"
++        ? `${NAMES[id]} ${Math.round(res[id].latency_ms || 0)} ms after the intent was evident` : `${NAMES[id]} missed it`));
++      out.push([mine.outcome === "yield" ? "good" : "bad", `Genuine interruption: ${parts.join("; ")}.`]);
+     } else {
+-      out.push(["neutral", `Ambiguous event: Baseline credit ${b.credit}, P3 credit ${p.credit}.`]);
++      out.push(["neutral", `Ambiguous event: ${DETS.map((id) => `${NAMES[id]} credit ${res[id].credit}`).join(", ")}.`]);
+     }
+   });
+   return out.length ? out : null;
+@@ -699,8 +703,8 @@ function renderEvents() {
+     return `<tr><td>${esc(ev.event_id.split(".").pop())}<br><small>${esc(ev.kind)}</small></td>` +
+       `<td><span class="pill ${esc(ev.expected)}">${exp}</span></td>` +
+       `<td><span dir="rtl" lang="ar">${esc(words || "–")}</span><br><small>${when}</small></td>` +
+-      `<td>${cell("baseline")}</td><td>${cell("p3")}</td></tr>`;
+-  }).join("") || `<tr><td colspan="5" class="pending">No labels for your own audio: compare the two detectors' decisions in the timeline and the log.</td></tr>`;
++      DETS.map((id) => `<td>${cell(id)}</td>`).join("") + "</tr>";
++  }).join("") || `<tr><td colspan="${3 + DETS.length}" class="pending">No labels for your own audio: compare the detectors' decisions in the timeline and the log.</td></tr>`;
+   const parts = DETS.map((id) => {
+     const p = S.ended && gt.events.length && S.det[id].score && S.det[id].score.protected;
+     return p ? `${NAMES[id]}: ${p.spurious_stops.length ? p.spurious_stops.map((x) => `${sec(x)} s`).join(", ") : "none"}` : null;
+@@ -719,15 +723,19 @@ function renderBench() {
+   $("bench-panel").hidden = !b;
+   if (!b) return;
+   const row = (m) => b.rows.find((r) => r.model === m) || {};
+-  const B = row("baseline"), P = row("p3");
++  const R = DETS.map(row);
+   const f = (x, d) => (x === null || x === undefined ? "–" : Number(x).toFixed(d));
+-  const lines = [["Official dev Core", f(B.core, 2), f(P.core, 2)], ["Responsiveness", f(B.R, 3), f(P.R, 3)],
+-    ["Restraint", f(B.S, 3), f(P.S, 3)], ["False-stop scoring events", B.false_stops, P.false_stops],
+-    ["Missed genuine interruptions", B.misses, P.misses]];
+-  $("bench").innerHTML = lines.map(([k, x, y]) => `<tr><td>${k}</td><td class="num">${esc(x)}</td><td class="num"><b>${esc(y)}</b></td></tr>`).join("");
++  const lines = [["Official dev Core", R.map((r) => f(r.core, 2))], ["Responsiveness", R.map((r) => f(r.R, 3))],
++    ["Restraint", R.map((r) => f(r.S, 3))], ["False-stop scoring events", R.map((r) => r.false_stops ?? "–")],
++    ["Missed genuine interruptions", R.map((r) => r.misses ?? "–")]];
++  $("bench-head").innerHTML = "<th>Metric</th>" + DETS.map((id) => `<th class="num">${esc(NAMES[id])}</th>`).join("");
++  $("bench").innerHTML = lines.map(([k, xs]) => `<tr><td>${k}</td>` +
++    xs.map((x, i) => `<td class="num">${DETS[i] === "baseline" ? esc(x) : `<b>${esc(x)}</b>`}</td>`).join("") + "</tr>").join("");
+   $("bench-note").textContent = `Source: ${b.source}; ${b.scope}. These numbers come from the 24 original competition development ` +
+     "recordings, not from the additional Phase 3 research scenarios. The Phase 3 holdout result is not an official competition score. " +
+-    "P3 is experimental, with known limitations: occasional delayed responses and missed quiet interruptions on the additional data.";
++    "P3 is experimental, with known limitations: occasional delayed responses and missed quiet interruptions on the additional data." +
++    (DETS.includes("v3") ? " SARJ v3 (acoustics + Arabic words layer with offline Whisper tiny) was measured with the same official real-time " +
++      "harness; on this hosted site its speech recognition runs on a small shared CPU, so its words can arrive later than in that measurement." : "");
+ }
+ 
+ function renderCredits() {
+@@ -739,8 +747,15 @@ function renderCredits() {
+ }
+ 
+ // ------------------------------------------------------------------------------------------------ timeline canvas
+-const LANES = { left: 70, right: 10, axis: 18, agent: [22, 70], caller: [96, 70], dets: { baseline: [172, 22], p3: [198, 22] }, labels: [226, 44] };
+-const H = 278;
++const LANES = { left: 70, right: 10, axis: 18, agent: [22, 70], caller: [96, 70], dets: {}, labels: [0, 44] };
++function layoutLanes() {                         // one 22 px lane per detector under the caller channel, then labels
++  let y = 172;
++  LANES.dets = {};
++  for (const id of DETS) { LANES.dets[id] = [y, 22]; y += 26; }
++  LANES.labels = [y + 2, 44];
++  H = y + 2 + 44 + 8;                             // canvas height follows the number of detector lanes
++}
++let H = 278;
+ 
+ function canvasSize() {
+   const cv = $("timeline");
+@@ -794,7 +809,7 @@ function buildStaticLayer() {
+   }
+   g.fillStyle = css("--text"); g.font = "600 11px system-ui, sans-serif";
+   g.fillText("Agent", 6, LANES.agent[0] + 4); g.fillText("Caller", 6, LANES.caller[0] + 4);
+-  g.fillText("Baseline", 6, LANES.dets.baseline[0] + 5); g.fillText("P3", 6, LANES.dets.p3[0] + 5);
++  for (const id of DETS) g.fillText(NAMES[id], 6, LANES.dets[id][0] + 5);
+   g.fillText("Labels", 6, ly + 4);
+   g.fillStyle = css("--muted"); g.font = "10px system-ui, sans-serif";
+   g.fillText("channel 0", 6, LANES.agent[0] + 18); g.fillText("channel 1", 6, LANES.caller[0] + 18);
+@@ -876,12 +891,20 @@ async function init() {
+   S.lookahead = S.config.lookahead_ms || 0;
+   S.pollMs = S.config.poll_ms || 15;
+   const msel = $("model");
+-  const order = ["p3", "baseline"];
++  const order = ["v3", "p3", "baseline"];
+   msel.innerHTML = order.filter((id) => S.models[id]).map((id) => { const m = S.models[id];
+     return `<option value="${esc(id)}" ${m.available ? "" : "disabled"}>${esc(m.name)} · ${esc(m.revision || "?")}${m.available ? "" : " (unavailable)"}</option>`; }).join("");
+-  if (!DETS.every((id) => S.models[id] && S.models[id].available)) {
+-    showError("Both detectors must be available; see the server console."); return;
+-  }
++  if (!REQUIRED.every((id) => S.models[id] && S.models[id].available)) {
++    showError("Baseline and P3 must be available; see the server console."); return;
++  }
++  // optional detectors (SARJ v3) join only when the server has them loaded
++  DETS = DETS.filter((id) => REQUIRED.includes(id) || (S.models[id] && S.models[id].available));
++  S.det = freshDets();
++  for (const id of ["v3"]) { const c = $(`card-${id}`); if (c) c.hidden = !DETS.includes(id); }
++  $("events-head").innerHTML = "<th>Event</th><th>Expected</th><th>Caller</th>" + DETS.map((id) => `<th>${esc(NAMES[id])}</th>`).join("");
++  $("duel").style.setProperty("--dets", String(DETS.length));
++  layoutLanes();
++  if (DETS.includes("v3")) S.listen = "v3";
+   msel.value = S.listen;
+   const pub = S.config.mode === "public";
+   const dev = collection("dev");
+diff --git a/demo/static/index.html b/demo/static/index.html
+index 1a468d4..687cdf0 100644
+--- a/demo/static/index.html
++++ b/demo/static/index.html
+@@ -4,9 +4,9 @@
+ <meta charset="utf-8">
+ <meta name="viewport" content="width=device-width, initial-scale=1">
+ <title>SARJ Detector Demo</title>
+-<meta name="description" content="Play a call and compare two interruption detectors, Baseline and P3, on the same audio.">
++<meta name="description" content="Play a call and compare interruption detectors (Baseline, P3 and SARJ v3) on the same audio.">
+ <meta property="og:title" content="SARJ interruption detector: Baseline vs P3">
+-<meta property="og:description" content="Play a call and watch two real detectors decide when the agent should stop talking.">
++<meta property="og:description" content="Play a call and watch real detectors decide when the agent should stop talking.">
+ <meta name="robots" content="noindex, nofollow">
+ <link rel="stylesheet" href="style.css">
+ </head>
+@@ -14,7 +14,7 @@
+ <header class="top">
+   <div>
+     <h1>SARJ interruption detector</h1>
+-    <p class="sub" id="subtitle">Play a call and compare two real detectors, Baseline and P3, on the same audio. Work in progress by a
++    <p class="sub" id="subtitle">Play a call and compare real detectors (Baseline, P3 and SARJ v3) on the same audio. Work in progress by a
+       university team: not the competition submission.</p>
+   </div>
+   <div class="chips">
+@@ -51,7 +51,7 @@
+   <section class="panel own" id="own-panel">
+     <div class="panel-head"><h2>Test your own audio</h2><span class="tag gt">processed in memory · not stored</span></div>
+     <p class="note own-help">Your audio becomes the <b>caller</b>; the <b>agent</b> is the original agent of the scenario selected above.
+-      Both detectors then run on it, exactly as on the 24 scenarios. <b>Record</b> plays the agent while you speak, so you can
++      All detectors then run on it, exactly as on the 24 scenarios. <b>Record</b> plays the agent while you speak, so you can
+       interrupt it naturally (headphones help: the agent's voice should not leak into your microphone). <b>Upload</b> takes a
+       recording of the caller side only. Your audio is used only for this test, held in the server's memory and deleted within
+       15 minutes; it is never saved to disk or logged. There are no labels for your own audio.</p>
+@@ -64,9 +64,10 @@
+   </section>
+ 
+   <section class="panel status-panel">
+-    <div class="duel">
++    <div class="duel" id="duel">
+       <div class="det-card" id="card-baseline"><div class="det-name">Baseline</div><div class="det-status" id="st-baseline">–</div></div>
+       <div class="det-card" id="card-p3"><div class="det-name">P3 Hybrid</div><div class="det-status" id="st-p3">–</div></div>
++      <div class="det-card" id="card-v3" hidden><div class="det-name">SARJ v3</div><div class="det-status" id="st-v3">–</div></div>
+     </div>
+     <div id="headline" class="headline" hidden></div>
+     <div class="utt" id="utt-text" dir="rtl" lang="ar"></div>
+@@ -89,7 +90,7 @@
+       </div>
+     </div>
+     <canvas id="timeline" height="290"></canvas>
+-    <p class="note">Waveforms show the original recording. Both detectors always receive this original audio (open loop, as in the
++    <p class="note">Waveforms show the original recording. All detectors always receive this original audio (open loop, as in the
+       official harness); muting the agent after a STOP changes only what you hear.</p>
+   </section>
+ 
+@@ -99,7 +100,7 @@
+       <div id="scenario-info" class="scen-info"></div>
+       <div class="table-wrap">
+         <table class="events">
+-          <thead><tr><th>Event</th><th>Expected</th><th>Caller</th><th>Baseline</th><th>P3</th></tr></thead>
++          <thead><tr id="events-head"><th>Event</th><th>Expected</th><th>Caller</th><th>Baseline</th><th>P3</th></tr></thead>
+           <tbody id="events"></tbody>
+         </table>
+       </div>
+@@ -168,7 +169,7 @@
+     <div class="panel-head"><h2>Official dev-set results</h2><span class="tag gt">recorded earlier, not live</span></div>
+     <div class="table-wrap">
+       <table class="bench">
+-        <thead><tr><th>Metric</th><th class="num">Baseline</th><th class="num">P3</th></tr></thead>
++        <thead><tr id="bench-head"><th>Metric</th><th class="num">Baseline</th><th class="num">P3</th></tr></thead>
+         <tbody id="bench"></tbody>
+       </table>
+     </div>
+@@ -179,7 +180,7 @@
+     <summary>How decisions reach this page</summary>
+     <ol>
+       <li>The page plays the call's two channels (agent and caller) from one audio clock and regularly reports its playhead to the server.</li>
+-      <li>The server runs both detectors, each in its own session, on the same frames. For each 20 ms frame it does what the kit's
++      <li>The server runs every detector, each in its own session, on the same frames. For each 20 ms frame it does what the kit's
+         harness and server do: the same control messages (<code>scenario_start</code>, <code>agent_utterance_start/end</code>) in the
+         same order, then the 1,280-byte stereo frame, into <code>MySystem.on_frame</code> of that detector, imported unchanged and
+         checked against its file hash. On the hosted site the server may run up to 0.8 s ahead of what you hear, so network delay
+diff --git a/demo/static/style.css b/demo/static/style.css
+index 4950edc..2f6b4a1 100644
+--- a/demo/static/style.css
++++ b/demo/static/style.css
+@@ -137,7 +137,7 @@ code { font-size: 12px; }
+ .scen-head h2 { font-size: 17px; }
+ .scen-expl { margin: 8px 0 0; font-size: 14px; }
+ .tag.private { background: var(--stop-soft); color: var(--stop); border: 1px solid var(--stop); }
+-.duel { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
++.duel { display: grid; grid-template-columns: repeat(var(--dets, 2), 1fr); gap: 12px; }
+ .det-card { border: 1px solid var(--line); border-left: 5px solid var(--muted); border-radius: 8px; padding: 10px 14px; background: var(--bg); }
+ .det-card.speaking { border-left-color: var(--agent); }
+ .det-card.stopped { border-left-color: var(--stop); background: var(--stop-soft); }
+@@ -153,6 +153,7 @@ code { font-size: 12px; }
+ .headline.bad { border-left: 5px solid var(--stop); }
+ .who { font-size: 11px; font-weight: 700; color: var(--muted); }
+ .who.p3 { color: var(--accent); }
++.who.v3 { color: var(--keep, #2e9e5b); }
+ #credits p { font-size: 13px; margin: 8px 0; }
+ #credits a, .scen-card a { color: var(--accent); word-break: break-all; }
+ @media (max-width: 640px) {
+diff --git a/experiments/evidence/runs.json b/experiments/evidence/runs.json
+index 49da051..0ce4826 100644
+--- a/experiments/evidence/runs.json
++++ b/experiments/evidence/runs.json
+@@ -1,228 +1,282 @@
+ {
+-  "scope": "local real-time dev runs in one Linux cloud container; not official event runs",
+-  "command": "python my_system.py --port <p> --quiet  &&  python -m ttbench.harness --data data/dev --url ws://127.0.0.1:<p> --out <run>",
+-  "speed": 1.0,
+-  "calls": "all 24 dev calls, default order",
+-  "data": {
+-    "manifest_sha256": "93a23bcd8eddd0c615488ef1089b6d252182eac71144dc2f359ad7ecb5029366",
+-    "version": "0.1.0-synthetic",
+-    "labels": "script_derived"
++ "scope": "local real-time dev runs in one Linux cloud container; not official event runs",
++ "command": "python my_system.py --port <p> --quiet  &&  python -m ttbench.harness --data data/dev --url ws://127.0.0.1:<p> --out <run>",
++ "speed": 1.0,
++ "calls": "all 24 dev calls, default order",
++ "data": {
++  "manifest_sha256": "93a23bcd8eddd0c615488ef1089b6d252182eac71144dc2f359ad7ecb5029366",
++  "version": "0.1.0-synthetic",
++  "labels": "script_derived"
++ },
++ "host": {
++  "os": "Linux-6.18.44-fc-v553-x86_64-with-glibc2.39",
++  "python": "3.13.18",
++  "cpus": 4,
++  "packages": {
++   "numpy": "2.5.5",
++   "websockets": "17.4",
++   "pytest": "9.2.0"
++  }
++ },
++ "runs": {
++  "baseline-bd2a3f0-rt": {
++   "system_commit": "bd2a3f0",
++   "hello_system_version": "bd2a3f0",
++   "started_utc": "2026-11-16T21:0x (Phase 1)",
++   "concurrent_load": "none",
++   "my_system_sha256": "85a8fa0ca7c6e0f92a01fb929877cf0eff36cb0d53749cceaeaf9b6de97fd830",
++   "harness_version": "0.1.0",
++   "completed": true,
++   "frames_sent": 29651,
++   "max_send_lag_ms": 1.87,
++   "rtt_summary_ms": {
++    "median": 0.61,
++    "max": 2.2,
++    "n": 119
++   },
++   "protocol_errors": 0,
++   "core": 41.04462072048882,
++   "R": 0.8057083333333334,
++   "S": 0.21944444444444444,
++   "misses": 2,
++   "false_stops": 25,
++   "files_sha256": {
++    "run.json": "180a4d32f02636cfc38d6d265d031e872a4849abea84fdb3bdb1d8c377d08d5d",
++    "score.json": "0b67a692e3568b54fdd959bee91a765202ac9e21d825618c103b56fa6884eed4",
++    "log.jsonl": "81c69905d6aa47ff9ccf2902a3d48c5ded89141ae902e86621db3169e3ea0acf",
++    "report.md": "80fc822c51ee3dc08f233a4f6a8b7f3b0d6233352fad58d31f94bddbaee4dfde"
++   }
++  },
++  "e01-8f08311-rt": {
++   "system_commit": "8f08311",
++   "hello_system_version": "8f08311",
++   "started_utc": "2026-11-16 (Phase 2 clean repeat)",
++   "concurrent_load": "none",
++   "my_system_sha256": "0958413417fdc335974578ee3b42c02556c6ee7ae77cc26fcf6a19bb354a39c9",
++   "harness_version": "0.1.0",
++   "completed": true,
++   "frames_sent": 29651,
++   "max_send_lag_ms": 0.01,
++   "rtt_summary_ms": {
++    "median": 0.75,
++    "max": 1.65,
++    "n": 119
++   },
++   "protocol_errors": 0,
++   "core": 44.05405405405405,
++   "R": 1.0,
++   "S": 0.23333333333333334,
++   "misses": 0,
++   "false_stops": 18,
++   "files_sha256": {
++    "run.json": "d1e594112c895659ce2eeebb8549497d60d5e3ff2f61d7529bf9db9b188d6686",
++    "score.json": "8e1f4bd2f15a234f1df6df3791cb9e546493ba27148c851eb6bf654b2cc876c6",
++    "log.jsonl": "bc23a5ef3aa54958bd303c7b741def4c8132d62a7c9570f3f7137f590eca59f4",
++    "report.md": "83d41f3487dbc9d41583c16b3330df2a398b2c5724849130de6f96d78a9b458f"
++   }
++  },
++  "e01b-e566234-rt": {
++   "system_commit": "e566234",
++   "hello_system_version": "fd0a286 (adds tools/robustness.py only; my_system.py identical to e566234)",
++   "started_utc": "2026-11-16T23:09:03Z",
++   "ended_utc": "2026-11-16T23:18:59Z",
++   "loadavg_start": "0.23 0.29 0.18",
++   "loadavg_end": "0.25 0.20 0.18",
++   "concurrent_load": "none",
++   "my_system_sha256": "455122a19d6ec8d3923f8a11e9d749ef9feb65ada8d95213d3958acd4a43e3a4",
++   "harness_version": "0.1.0",
++   "completed": true,
++   "frames_sent": 29651,
++   "max_send_lag_ms": 2.04,
++   "rtt_summary_ms": {
++    "median": 0.98,
++    "max": 3.57,
++    "n": 119
++   },
++   "protocol_errors": 0,
++   "core": 54.71816283924844,
++   "R": 1.0,
++   "S": 0.33055555555555555,
++   "misses": 0,
++   "false_stops": 16,
++   "files_sha256": {
++    "run.json": "723a4816bde0cde8250f1b32bc485e3b46a099d52932ea29e2b6c01182602007",
++    "score.json": "7bd6c0b64e2badfb660a763ebc034dcb711f40486df03745080f35e6061c7419",
++    "log.jsonl": "9eb4bb086b6a1ff66f3805fa5b31ead634fd0869a142b25545603fd1a5f6063b",
++    "report.md": "2172d98bc130c6c3896b5ea4f2db348578136c174e76c6e2ece6d4330d04cadc"
++   }
++  },
++  "p3-6b4eece-rt": {
++   "system_commit": "6b4eece",
++   "started_utc": "2026-11-17T04:59:19Z",
++   "ended_utc": "2026-11-17T05:09:13Z",
++   "command": "python my_system.py --port 8771 --quiet",
++   "hello_system_version": "6b4eece",
++   "configuration": "my_system.py defaults (Phase 3 candidate, pilot N1)",
++   "concurrent_load": "none (report being edited; no replay or test running)",
++   "my_system_sha256": "8066ae363967adebb61e4bb9841d816b1d7b130bda837c66c826c5be1ef9d4bf",
++   "packages": {
++    "numpy": "2.5.3",
++    "onnxruntime": "1.29.0",
++    "websockets": "17.4"
++   },
++   "model": {
++    "file": "models/silero_vad.onnx",
++    "sha256": "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
++   },
++   "harness_version": "0.1.0",
++   "completed": true,
++   "frames_sent": 29651,
++   "max_send_lag_ms": 0.01,
++   "rtt_summary_ms": {
++    "median": 0.88,
++    "max": 1.82,
++    "n": 119
++   },
++   "protocol_errors": 0,
++   "core": 73.41032894095738,
++   "R": 0.9934499999999999,
++   "S": 0.5458333333333333,
++   "misses": 0,
++   "false_stops": 10,
++   "stop_latency_after_evident_ms": {
++    "median": 0.0,
++    "p90": 352.3
++   },
++   "stop_after_caller_onset_ms": [
++    243.0,
++    252.0,
++    302.0,
++    332.0,
++    342.0,
++    342.0,
++    1072.0
++   ],
++   "decision_arrival_after_frame_send_ms": [
++    0.9,
++    3.1
++   ],
++   "decisions": 33,
++   "same_decisions_and_frames_as_offline_replay": true,
++   "files_sha256": {
++    "run.json": "9d87588e751872caea43460681c29808098e441c5e02cd0df34c9094b5f3dba9",
++    "score.json": "1108f977185bd9dddee74541b12a0b844e0af50acda2dbad3289e2767d51949a",
++    "log.jsonl": "768e165af9d6304819f8084c5989848fcf4fac0a75371109908a23ec1d8fa9f8",
++    "report.md": "c8738b4f1f42e234868934d11620da25476036ff308a2168627101204ace4ce3"
++   }
+   },
+-  "host": {
+-    "os": "Linux-6.18.44-fc-v553-x86_64-with-glibc2.39",
+-    "python": "3.13.18",
+-    "cpus": 4,
+-    "packages": {
+-      "numpy": "2.5.5",
+-      "websockets": "17.4",
+-      "pytest": "9.2.0"
+-    }
++  "vadonly-6b4eece-rt": {
++   "system_commit": "6b4eece",
++   "started_utc": "2026-11-17T05:09:17Z",
++   "ended_utc": "2026-11-17T05:19:11Z",
++   "command": "python tools/serve_config.py --set '{\"CALLER_REF\": false, \"EVIDENCE_WINDOW_MS\": 300}' --port 8772 --quiet",
++   "hello_system_version": "6b4eece-dirty (the only uncommitted change at server start was WRITEUP.md section 8; my_system.py sha256 identical to 6b4eece)",
++   "configuration": "Silero speech frames, no caller reference, 300 ms window (pilot B1)",
++   "concurrent_load": "none (report being edited; no replay or test running)",
++   "my_system_sha256": "8066ae363967adebb61e4bb9841d816b1d7b130bda837c66c826c5be1ef9d4bf",
++   "packages": {
++    "numpy": "2.5.3",
++    "onnxruntime": "1.29.0",
++    "websockets": "17.4"
++   },
++   "model": {
++    "file": "models/silero_vad.onnx",
++    "sha256": "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
++   },
++   "harness_version": "0.1.0",
++   "completed": true,
++   "frames_sent": 29651,
++   "max_send_lag_ms": 0.02,
++   "rtt_summary_ms": {
++    "median": 0.95,
++    "max": 2.82,
++    "n": 119
++   },
++   "protocol_errors": 0,
++   "core": 60.69369439307945,
++   "R": 0.993475,
++   "S": 0.39305555555555555,
++   "misses": 0,
++   "false_stops": 13,
++   "stop_latency_after_evident_ms": {
++    "median": 0.0,
++    "p90": 352.2
++   },
++   "stop_after_caller_onset_ms": [
++    222.0,
++    242.0,
++    252.0,
++    302.0,
++    321.0,
++    332.0,
++    1072.0
++   ],
++   "decision_arrival_after_frame_send_ms": [
++    0.9,
++    2.32
++   ],
++   "decisions": 35,
++   "same_decisions_and_frames_as_offline_replay": true,
++   "files_sha256": {
++    "run.json": "fd8ff0901c188d4cbf0bfa769641f7b6e4b5969b5a2e7e669cb866b7d5bc4d5e",
++    "score.json": "b7c0f43f231caf0ae4fe7ef08b73c719ebe4a83fc1e27563e4810c88b35a2663",
++    "log.jsonl": "006045eabe6e2fc5c0f896f6769eecba0aae35df07314a276000b7096057be36",
++    "report.md": "98b7a0f493698541ca853e130a944c3a29ccb0d469de2008fddfe4db12f81131"
++   }
+   },
+-  "runs": {
+-    "baseline-bd2a3f0-rt": {
+-      "system_commit": "bd2a3f0",
+-      "hello_system_version": "bd2a3f0",
+-      "started_utc": "2026-11-16T21:0x (Phase 1)",
+-      "concurrent_load": "none",
+-      "my_system_sha256": "85a8fa0ca7c6e0f92a01fb929877cf0eff36cb0d53749cceaeaf9b6de97fd830",
+-      "harness_version": "0.1.0",
+-      "completed": true,
+-      "frames_sent": 29651,
+-      "max_send_lag_ms": 1.87,
+-      "rtt_summary_ms": {
+-        "median": 0.61,
+-        "max": 2.2,
+-        "n": 119
+-      },
+-      "protocol_errors": 0,
+-      "core": 41.04462072048882,
+-      "R": 0.8057083333333334,
+-      "S": 0.21944444444444444,
+-      "misses": 2,
+-      "false_stops": 25,
+-      "files_sha256": {
+-        "run.json": "180a4d32f02636cfc38d6d265d031e872a4849abea84fdb3bdb1d8c377d08d5d",
+-        "score.json": "0b67a692e3568b54fdd959bee91a765202ac9e21d825618c103b56fa6884eed4",
+-        "log.jsonl": "81c69905d6aa47ff9ccf2902a3d48c5ded89141ae902e86621db3169e3ea0acf",
+-        "report.md": "80fc822c51ee3dc08f233a4f6a8b7f3b0d6233352fad58d31f94bddbaee4dfde"
+-      }
+-    },
+-    "e01-8f08311-rt": {
+-      "system_commit": "8f08311",
+-      "hello_system_version": "8f08311",
+-      "started_utc": "2026-11-16 (Phase 2 clean repeat)",
+-      "concurrent_load": "none",
+-      "my_system_sha256": "0958413417fdc335974578ee3b42c02556c6ee7ae77cc26fcf6a19bb354a39c9",
+-      "harness_version": "0.1.0",
+-      "completed": true,
+-      "frames_sent": 29651,
+-      "max_send_lag_ms": 0.01,
+-      "rtt_summary_ms": {
+-        "median": 0.75,
+-        "max": 1.65,
+-        "n": 119
+-      },
+-      "protocol_errors": 0,
+-      "core": 44.05405405405405,
+-      "R": 1.0,
+-      "S": 0.23333333333333334,
+-      "misses": 0,
+-      "false_stops": 18,
+-      "files_sha256": {
+-        "run.json": "d1e594112c895659ce2eeebb8549497d60d5e3ff2f61d7529bf9db9b188d6686",
+-        "score.json": "8e1f4bd2f15a234f1df6df3791cb9e546493ba27148c851eb6bf654b2cc876c6",
+-        "log.jsonl": "bc23a5ef3aa54958bd303c7b741def4c8132d62a7c9570f3f7137f590eca59f4",
+-        "report.md": "83d41f3487dbc9d41583c16b3330df2a398b2c5724849130de6f96d78a9b458f"
+-      }
+-    },
+-    "e01b-e566234-rt": {
+-      "system_commit": "e566234",
+-      "hello_system_version": "fd0a286 (adds tools/robustness.py only; my_system.py identical to e566234)",
+-      "started_utc": "2026-11-16T23:09:03Z",
+-      "ended_utc": "2026-11-16T23:18:59Z",
+-      "loadavg_start": "0.23 0.29 0.18",
+-      "loadavg_end": "0.25 0.20 0.18",
+-      "concurrent_load": "none",
+-      "my_system_sha256": "455122a19d6ec8d3923f8a11e9d749ef9feb65ada8d95213d3958acd4a43e3a4",
+-      "harness_version": "0.1.0",
+-      "completed": true,
+-      "frames_sent": 29651,
+-      "max_send_lag_ms": 2.04,
+-      "rtt_summary_ms": {
+-        "median": 0.98,
+-        "max": 3.57,
+-        "n": 119
+-      },
+-      "protocol_errors": 0,
+-      "core": 54.71816283924844,
+-      "R": 1.0,
+-      "S": 0.33055555555555555,
+-      "misses": 0,
+-      "false_stops": 16,
+-      "files_sha256": {
+-        "run.json": "723a4816bde0cde8250f1b32bc485e3b46a099d52932ea29e2b6c01182602007",
+-        "score.json": "7bd6c0b64e2badfb660a763ebc034dcb711f40486df03745080f35e6061c7419",
+-        "log.jsonl": "9eb4bb086b6a1ff66f3805fa5b31ead634fd0869a142b25545603fd1a5f6063b",
+-        "report.md": "2172d98bc130c6c3896b5ea4f2db348578136c174e76c6e2ece6d4330d04cadc"
+-      }
+-    },
+-    "p3-6b4eece-rt": {
+-      "system_commit": "6b4eece",
+-      "started_utc": "2026-11-17T04:59:19Z",
+-      "ended_utc": "2026-11-17T05:09:13Z",
+-      "command": "python my_system.py --port 8771 --quiet",
+-      "hello_system_version": "6b4eece",
+-      "configuration": "my_system.py defaults (Phase 3 candidate, pilot N1)",
+-      "concurrent_load": "none (report being edited; no replay or test running)",
+-      "my_system_sha256": "8066ae363967adebb61e4bb9841d816b1d7b130bda837c66c826c5be1ef9d4bf",
+-      "packages": {
+-        "numpy": "2.5.3",
+-        "onnxruntime": "1.29.0",
+-        "websockets": "17.4"
+-      },
+-      "model": {
+-        "file": "models/silero_vad.onnx",
+-        "sha256": "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
+-      },
+-      "harness_version": "0.1.0",
+-      "completed": true,
+-      "frames_sent": 29651,
+-      "max_send_lag_ms": 0.01,
+-      "rtt_summary_ms": {
+-        "median": 0.88,
+-        "max": 1.82,
+-        "n": 119
+-      },
+-      "protocol_errors": 0,
+-      "core": 73.41032894095738,
+-      "R": 0.9934499999999999,
+-      "S": 0.5458333333333333,
+-      "misses": 0,
+-      "false_stops": 10,
+-      "stop_latency_after_evident_ms": {
+-        "median": 0.0,
+-        "p90": 352.3
+-      },
+-      "stop_after_caller_onset_ms": [
+-        243.0,
+-        252.0,
+-        302.0,
+-        332.0,
+-        342.0,
+-        342.0,
+-        1072.0
+-      ],
+-      "decision_arrival_after_frame_send_ms": [
+-        0.9,
+-        3.1
+-      ],
+-      "decisions": 33,
+-      "same_decisions_and_frames_as_offline_replay": true,
+-      "files_sha256": {
+-        "run.json": "9d87588e751872caea43460681c29808098e441c5e02cd0df34c9094b5f3dba9",
+-        "score.json": "1108f977185bd9dddee74541b12a0b844e0af50acda2dbad3289e2767d51949a",
+-        "log.jsonl": "768e165af9d6304819f8084c5989848fcf4fac0a75371109908a23ec1d8fa9f8",
+-        "report.md": "c8738b4f1f42e234868934d11620da25476036ff308a2168627101204ace4ce3"
+-      }
+-    },
+-    "vadonly-6b4eece-rt": {
+-      "system_commit": "6b4eece",
+-      "started_utc": "2026-11-17T05:09:17Z",
+-      "ended_utc": "2026-11-17T05:19:11Z",
+-      "command": "python tools/serve_config.py --set '{\"CALLER_REF\": false, \"EVIDENCE_WINDOW_MS\": 300}' --port 8772 --quiet",
+-      "hello_system_version": "6b4eece-dirty (the only uncommitted change at server start was WRITEUP.md section 8; my_system.py sha256 identical to 6b4eece)",
+-      "configuration": "Silero speech frames, no caller reference, 300 ms window (pilot B1)",
+-      "concurrent_load": "none (report being edited; no replay or test running)",
+-      "my_system_sha256": "8066ae363967adebb61e4bb9841d816b1d7b130bda837c66c826c5be1ef9d4bf",
+-      "packages": {
+-        "numpy": "2.5.3",
+-        "onnxruntime": "1.29.0",
+-        "websockets": "17.4"
+-      },
+-      "model": {
+-        "file": "models/silero_vad.onnx",
+-        "sha256": "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
+-      },
+-      "harness_version": "0.1.0",
+-      "completed": true,
+-      "frames_sent": 29651,
+-      "max_send_lag_ms": 0.02,
+-      "rtt_summary_ms": {
+-        "median": 0.95,
+-        "max": 2.82,
+-        "n": 119
+-      },
+-      "protocol_errors": 0,
+-      "core": 60.69369439307945,
+-      "R": 0.993475,
+-      "S": 0.39305555555555555,
+-      "misses": 0,
+-      "false_stops": 13,
+-      "stop_latency_after_evident_ms": {
+-        "median": 0.0,
+-        "p90": 352.2
+-      },
+-      "stop_after_caller_onset_ms": [
+-        222.0,
+-        242.0,
+-        252.0,
+-        302.0,
+-        321.0,
+-        332.0,
+-        1072.0
+-      ],
+-      "decision_arrival_after_frame_send_ms": [
+-        0.9,
+-        2.32
+-      ],
+-      "decisions": 35,
+-      "same_decisions_and_frames_as_offline_replay": true,
+-      "files_sha256": {
+-        "run.json": "fd8ff0901c188d4cbf0bfa769641f7b6e4b5969b5a2e7e669cb866b7d5bc4d5e",
+-        "score.json": "b7c0f43f231caf0ae4fe7ef08b73c719ebe4a83fc1e27563e4810c88b35a2663",
+-        "log.jsonl": "006045eabe6e2fc5c0f896f6769eecba0aae35df07314a276000b7096057be36",
+-        "report.md": "98b7a0f493698541ca853e130a944c3a29ccb0d469de2008fddfe4db12f81131"
+-      }
+-    }
++  "v3-18471a8-rt": {
++   "system_commit": "18471a8 (leenalotaibi-source/sarj, branch claude/sarj-turn-taking-system-xwvrh0)",
++   "started_utc": "2026-11-18T16:42:54Z",
++   "ended_utc": "2026-11-18T16:52:50Z",
++   "command": "python -m ttbench.play --system demo/models/sarj_v3/my_system.py --calls all --name v3-demo-rt",
++   "configuration": "tt/config.py defaults (words layer on: faster-whisper tiny, int8, 2 threads)",
++   "concurrent_load": "none",
++   "host": "cloud container, x86_64, 4 vCPU (not the team laptop)",
++   "my_system_sha256": "09e5b65a117895dc15ce75a700cb48e313cd121c7ac1738559e320606cfcd1b8",
++   "files_pinned": {
++    "demo/models/sarj_v3/tt/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
++    "demo/models/sarj_v3/tt/config.py": "6dfbbe3fe26e2502287545dd6a53b51f96069da1fa3e4266cf4107252b599778",
++    "demo/models/sarj_v3/tt/decider.py": "5e59028e2225717d48e115f077b470fd07057794241a25fb91f71cf6e6567a80",
++    "demo/models/sarj_v3/tt/frontend.py": "85a3b2715c1c12d3c4b183e8a99515d1a30a10a596eb6e43a18ac5f86cae22b7",
++    "demo/models/sarj_v3/tt/prefix.py": "1559dd15e907b006132f76e3365a51632a6f65acaf32ceff3c49076eabe3daa8",
++    "demo/models/sarj_v3/tt/words.py": "c77aaf471db0676c9c6653ae5e06b646bfd46dd61a59330c22dadde417b70785"
++   },
++   "packages": {
++    "numpy": "2.5.5",
++    "websockets": "17.4",
++    "faster-whisper": "1.2.1",
++    "ctranslate2": "4.9.0"
++   },
++   "model": {
++    "file": "models/faster-whisper-tiny/model.bin (Systran/faster-whisper-tiny)",
++    "sha256": "dcb76c6586fc06cbdac6dd21f14cfd129cc4cdd9dce19bf4ffa62e59cbe6e6d1"
++   },
++   "harness_version": "0.1.0",
++   "completed": true,
++   "frames_sent": 29651,
++   "max_send_lag_ms": 0.62,
++   "rtt_summary_ms": {
++    "median": 1.07,
++    "max": 4.61,
++    "n": 119
++   },
++   "protocol_errors": 0,
++   "core": 96.37563488962688,
++   "R": 0.950875,
++   "S": 0.96875,
++   "misses": 0,
++   "false_stops": 1,
++   "stop_latency_after_evident_ms": {
++    "median": 252.1,
++    "p90": 871.2
++   },
++   "decisions": 9,
++   "files_sha256": {
++    "run.json": "1ea7bd3cd412907fac09a4135e6016d219907d1103cb0a5367761ae5783d8920",
++    "score.json": "ccbda22b7a9eee74a3f3e60d33b743935a25ffa4c7fd2afaec366b6fa22b8593",
++    "log.jsonl": "84cf99b66b435ae62ea46e1987393ffb0fb9c17a1c8acb5a7ebebceaa4227ff8",
++    "report.md": "73a880d9cd65482840664df4a8e280b178af4b67fc3a3b8b993b9a2e82a5ae4e"
++   }
+   }
++ }
+ }
+diff --git a/experiments/evidence/v3-18471a8-rt/log.jsonl b/experiments/evidence/v3-18471a8-rt/log.jsonl
+new file mode 100644
+index 0000000..119d8b0
+--- /dev/null
++++ b/experiments/evidence/v3-18471a8-rt/log.jsonl
+@@ -0,0 +1,277 @@
++{"seq": 1, "dir": "rx", "t_mono_ns": 461404191186, "stream_ms": null, "msg": {"type": "hello", "team": "my-team", "system_version": "3b76ebb-dirty", "tracks": ["core", "eot"]}}
++{"seq": 2, "dir": "tx", "t_mono_ns": 461404440614, "stream_ms": 0.0, "msg": {"type": "session_start", "session_id": "dev", "sample_rate": 16000, "frame_ms": 20, "channels": ["agent", "user"]}}
++{"seq": 3, "dir": "tx", "t_mono_ns": 461404577027, "stream_ms": 0, "msg": {"type": "scenario_start", "scenario_id": "GI-D01", "stream_ms": 0, "context": {"use_case": "delivery scheduling", "language": "ar"}}}
++{"seq": 4, "dir": "rx", "t_mono_ns": 461406223527, "stream_ms": 1.73, "msg": {"type": "pong", "id": 1}}
++{"seq": 5, "dir": "tx", "t_mono_ns": 461705678125, "stream_ms": 300, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 300, "text": "السلام عليكم، معك ريم من متجر نوّار. أكلّم الأستاذ فهد؟", "duration_ms": 4760}}
++{"seq": 6, "dir": "rx", "t_mono_ns": 466406191135, "stream_ms": 5001.67, "msg": {"type": "pong", "id": 2}}
++{"seq": 7, "dir": "tx", "t_mono_ns": 466465647279, "stream_ms": 5060, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 5060}}
++{"seq": 8, "dir": "tx", "t_mono_ns": 469285167232, "stream_ms": 7880, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 7890, "text": "حياك الله يا أستاذ فهد. أتصل عليك بخصوص طلبك، الطلب بيوصلك بكرة إن شاء الله بين الساعة أربع وست العصر، والمندوب بيتصل عليك قبل ما يوصل بنص ساعة تقريباً، وإذا حاب تغيّر وقت التوصيل تقدر ترد على رسالة التأكيد اللي بتوصلك.", "duration_ms": 16970}}
++{"seq": 9, "dir": "rx", "t_mono_ns": 471406756391, "stream_ms": 10002.23, "msg": {"type": "pong", "id": 3}}
++{"seq": 10, "dir": "rx", "t_mono_ns": 476406416009, "stream_ms": 15001.92, "msg": {"type": "pong", "id": 4}}
++{"seq": 11, "dir": "rx", "t_mono_ns": 478706278195, "stream_ms": 17301.79, "msg": {"type": "decision", "decision": "STOP"}}
++{"seq": 12, "dir": "rx", "t_mono_ns": 481406151292, "stream_ms": 20001.65, "msg": {"type": "pong", "id": 5}}
++{"seq": 13, "dir": "tx", "t_mono_ns": 486265395525, "stream_ms": 24860, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 24860}}
++{"seq": 14, "dir": "rx", "t_mono_ns": 486406515436, "stream_ms": 25002.01, "msg": {"type": "pong", "id": 6}}
++{"seq": 15, "dir": "tx", "t_mono_ns": 488264924132, "stream_ms": 26860, "msg": {"type": "scenario_end", "scenario_id": "GI-D01", "stream_ms": 26860}}
++{"seq": 16, "dir": "tx", "t_mono_ns": 489765507288, "stream_ms": 28360, "msg": {"type": "scenario_start", "scenario_id": "GI-D02", "stream_ms": 28360, "context": {"use_case": "clinic appointment reminder", "language": "ar"}}}
++{"seq": 17, "dir": "tx", "t_mono_ns": 490065113531, "stream_ms": 28660, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 28660, "text": "مساء الخير، معك سلمى من عيادات رِفاه. معي الأستاذة هند؟", "duration_ms": 5100}}
++{"seq": 18, "dir": "rx", "t_mono_ns": 491406800555, "stream_ms": 30002.3, "msg": {"type": "pong", "id": 7}}
++{"seq": 19, "dir": "tx", "t_mono_ns": 495165164101, "stream_ms": 33760, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 33760}}
++{"seq": 20, "dir": "rx", "t_mono_ns": 496407063551, "stream_ms": 35002.57, "msg": {"type": "pong", "id": 8}}
++{"seq": 21, "dir": "tx", "t_mono_ns": 498205157864, "stream_ms": 36800, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 36800, "text": "أهلين أستاذة هند. حبيت أذكّرك بموعدك يوم الأحد الساعة عشرة الصبح، مع الدكتورة نورة، ونرجو الحضور قبل الموعد بربع ساعة عشان إجراءات التسجيل، ولو عندك تأمين طبي لا تنسين تجيبين البطاقة معك.", "duration_ms": 15250}}
++{"seq": 22, "dir": "rx", "t_mono_ns": 501406310534, "stream_ms": 40001.82, "msg": {"type": "pong", "id": 9}}
++{"seq": 23, "dir": "rx", "t_mono_ns": 506406860231, "stream_ms": 45002.36, "msg": {"type": "pong", "id": 10}}
++{"seq": 24, "dir": "rx", "t_mono_ns": 506665722316, "stream_ms": 45261.22, "msg": {"type": "decision", "decision": "STOP"}}
++{"seq": 25, "dir": "rx", "t_mono_ns": 511406781391, "stream_ms": 50002.28, "msg": {"type": "pong", "id": 11}}
++{"seq": 26, "dir": "tx", "t_mono_ns": 513464985947, "stream_ms": 52060, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 52050}}
++{"seq": 27, "dir": "tx", "t_mono_ns": 515465490089, "stream_ms": 54060, "msg": {"type": "scenario_end", "scenario_id": "GI-D02", "stream_ms": 54060}}
++{"seq": 28, "dir": "rx", "t_mono_ns": 516406545953, "stream_ms": 55002.04, "msg": {"type": "pong", "id": 12}}
++{"seq": 29, "dir": "tx", "t_mono_ns": 516965336378, "stream_ms": 55560, "msg": {"type": "scenario_start", "scenario_id": "GI-D03", "stream_ms": 55560, "context": {"use_case": "card activation", "language": "ar"}}}
++{"seq": 30, "dir": "tx", "t_mono_ns": 517265034689, "stream_ms": 55860, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 55860, "text": "هلا، معك عبدالله من خدمة العملاء في البنك. أكلّم الأستاذ ماجد؟", "duration_ms": 4410}}
++{"seq": 31, "dir": "rx", "t_mono_ns": 521406386417, "stream_ms": 60001.89, "msg": {"type": "pong", "id": 13}}
++{"seq": 32, "dir": "tx", "t_mono_ns": 521684997353, "stream_ms": 60280, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 60270}}
++{"seq": 33, "dir": "tx", "t_mono_ns": 523465105768, "stream_ms": 62060, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 62060, "text": "يا هلا. عشان نفعّل بطاقتك الجديدة بنرسل لك الحين رمز تحقق على جوالك، والرمز صالح لمدة خمس دقايق بس، ولا تشاركه مع أي أحد حتى لو قال لك إنه موظف في البنك، وبعد ما يوصلك الرمز بأطلب منك تقراه لي رقم رقم.", "duration_ms": 16290}}
++{"seq": 34, "dir": "rx", "t_mono_ns": 526406529741, "stream_ms": 65002.03, "msg": {"type": "pong", "id": 14}}
++{"seq": 35, "dir": "rx", "t_mono_ns": 529906534036, "stream_ms": 68502.05, "msg": {"type": "decision", "decision": "STOP"}}
++{"seq": 36, "dir": "rx", "t_mono_ns": 531406880220, "stream_ms": 70002.38, "msg": {"type": "pong", "id": 15}}
++{"seq": 37, "dir": "rx", "t_mono_ns": 536406392865, "stream_ms": 75001.9, "msg": {"type": "pong", "id": 16}}
++{"seq": 38, "dir": "tx", "t_mono_ns": 539764966400, "stream_ms": 78360, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 78350}}
++{"seq": 39, "dir": "rx", "t_mono_ns": 541406650805, "stream_ms": 80002.15, "msg": {"type": "pong", "id": 17}}
++{"seq": 40, "dir": "tx", "t_mono_ns": 541765560134, "stream_ms": 80360, "msg": {"type": "scenario_end", "scenario_id": "GI-D03", "stream_ms": 80360}}
++{"seq": 41, "dir": "tx", "t_mono_ns": 543265999613, "stream_ms": 81860, "msg": {"type": "scenario_start", "scenario_id": "BC-D01", "stream_ms": 81860, "context": {"use_case": "plan renewal", "language": "ar"}}}
++{"seq": 42, "dir": "tx", "t_mono_ns": 543565314118, "stream_ms": 82160, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 82160, "text": "السلام عليكم، معك نوف من سَنا للاتصالات. معي الأستاذ سعد؟", "duration_ms": 4780}}
++{"seq": 43, "dir": "rx", "t_mono_ns": 546405974065, "stream_ms": 85001.47, "msg": {"type": "pong", "id": 18}}
++{"seq": 44, "dir": "tx", "t_mono_ns": 548345147242, "stream_ms": 86940, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 86940}}
++{"seq": 45, "dir": "tx", "t_mono_ns": 550405282687, "stream_ms": 89000, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 89010, "text": "حياك الله. حبيت أبلغك إن باقتك الحالية بتنتهي بعد ثلاث أيام، وعندنا لك باقة جديدة فيها مية قيقا إنترنت ومكالمات بدون حد داخل الشبكة، وسعرها تقريباً نفس سعر باقتك الحالية.", "duration_ms": 14480}}
++{"seq": 46, "dir": "rx", "t_mono_ns": 551406547642, "stream_ms": 90002.05, "msg": {"type": "pong", "id": 19}}
++{"seq": 47, "dir": "rx", "t_mono_ns": 556406234289, "stream_ms": 95001.74, "msg": {"type": "pong", "id": 20}}
++{"seq": 48, "dir": "rx", "t_mono_ns": 561406381523, "stream_ms": 100001.88, "msg": {"type": "pong", "id": 21}}
++{"seq": 49, "dir": "tx", "t_mono_ns": 564905036262, "stream_ms": 103500, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 103490}}
++{"seq": 50, "dir": "rx", "t_mono_ns": 566406907254, "stream_ms": 105002.41, "msg": {"type": "pong", "id": 22}}
++{"seq": 51, "dir": "tx", "t_mono_ns": 566905379467, "stream_ms": 105500, "msg": {"type": "scenario_end", "scenario_id": "BC-D01", "stream_ms": 105500}}
++{"seq": 52, "dir": "tx", "t_mono_ns": 568405546150, "stream_ms": 107000, "msg": {"type": "scenario_start", "scenario_id": "BC-D02", "stream_ms": 107000, "context": {"use_case": "instalment explanation", "language": "ar"}}}
++{"seq": 53, "dir": "tx", "t_mono_ns": 568705229902, "stream_ms": 107300, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 107300, "text": "مساء الخير، معك خالد من متجر نوّار. معي الأستاذة ريم؟", "duration_ms": 5150}}
++{"seq": 54, "dir": "rx", "t_mono_ns": 571406325539, "stream_ms": 110001.82, "msg": {"type": "pong", "id": 23}}
++{"seq": 55, "dir": "tx", "t_mono_ns": 573865370403, "stream_ms": 112460, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 112450}}
++{"seq": 56, "dir": "tx", "t_mono_ns": 575404940224, "stream_ms": 114000, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 114000, "text": "هلا فيك. بس حبيت أوضح لك طريقة التقسيط: المبلغ الإجمالي ألف ومية وعشرين ريال، ينقسم على أربع دفعات، كل دفعة مئتين وثمانين ريال، أول دفعة تنخصم اليوم، والباقي كل شهر بنفس التاريخ، وقبل كل دفعة بيوصلك تذكير برسالة، وتقدر تشوف كل الدفعات من التطبيق.", "duration_ms": 21240}}
++{"seq": 57, "dir": "rx", "t_mono_ns": 576407239737, "stream_ms": 115002.74, "msg": {"type": "pong", "id": 24}}
++{"seq": 58, "dir": "rx", "t_mono_ns": 581406249249, "stream_ms": 120001.75, "msg": {"type": "pong", "id": 25}}
++{"seq": 59, "dir": "rx", "t_mono_ns": 586406136074, "stream_ms": 125001.64, "msg": {"type": "pong", "id": 26}}
++{"seq": 60, "dir": "rx", "t_mono_ns": 591409163872, "stream_ms": 130004.67, "msg": {"type": "pong", "id": 27}}
++{"seq": 61, "dir": "rx", "t_mono_ns": 596406514161, "stream_ms": 135002.0, "msg": {"type": "pong", "id": 28}}
++{"seq": 62, "dir": "tx", "t_mono_ns": 596645874678, "stream_ms": 135240, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 135240}}
++{"seq": 63, "dir": "tx", "t_mono_ns": 598645887280, "stream_ms": 137240, "msg": {"type": "scenario_end", "scenario_id": "BC-D02", "stream_ms": 137240}}
++{"seq": 64, "dir": "tx", "t_mono_ns": 600144916792, "stream_ms": 138740, "msg": {"type": "scenario_start", "scenario_id": "BC-D03", "stream_ms": 138740, "context": {"use_case": "auto-pay setup", "language": "ar"}}}
++{"seq": 65, "dir": "tx", "t_mono_ns": 600445456733, "stream_ms": 139040, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 139040, "text": "هلا، معك سارة من البنك. أكلّم الأستاذ ناصر؟", "duration_ms": 3840}}
++{"seq": 66, "dir": "rx", "t_mono_ns": 601406992879, "stream_ms": 140002.5, "msg": {"type": "pong", "id": 29}}
++{"seq": 67, "dir": "tx", "t_mono_ns": 604285392916, "stream_ms": 142880, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 142880}}
++{"seq": 68, "dir": "tx", "t_mono_ns": 605605384225, "stream_ms": 144200, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 144210, "text": "حياك الله. نبي نذكرك إنك تقدر تفعّل السداد التلقائي لفاتورة البطاقة، لأن كثير من العملاء يدفعون رسوم تأخير بدون ما ينتبهون، فالتفعيل التلقائي يريحك من هالشي، وتقدر توقفه أي وقت من التطبيق، وما فيه أي رسوم على الخدمة.", "duration_ms": 17990}}
++{"seq": 69, "dir": "rx", "t_mono_ns": 606406514968, "stream_ms": 145002.02, "msg": {"type": "pong", "id": 30}}
++{"seq": 70, "dir": "rx", "t_mono_ns": 611406640830, "stream_ms": 150002.14, "msg": {"type": "pong", "id": 31}}
++{"seq": 71, "dir": "rx", "t_mono_ns": 616407104702, "stream_ms": 155002.61, "msg": {"type": "pong", "id": 32}}
++{"seq": 72, "dir": "rx", "t_mono_ns": 621406504617, "stream_ms": 160001.99, "msg": {"type": "pong", "id": 33}}
++{"seq": 73, "dir": "tx", "t_mono_ns": 623605535402, "stream_ms": 162200, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 162200}}
++{"seq": 74, "dir": "tx", "t_mono_ns": 625605679662, "stream_ms": 164200, "msg": {"type": "scenario_end", "scenario_id": "BC-D03", "stream_ms": 164200}}
++{"seq": 75, "dir": "rx", "t_mono_ns": 626406121944, "stream_ms": 165001.63, "msg": {"type": "pong", "id": 34}}
++{"seq": 76, "dir": "tx", "t_mono_ns": 627105323376, "stream_ms": 165700, "msg": {"type": "scenario_start", "scenario_id": "HT-D01", "stream_ms": 165700, "context": {"use_case": "callback time", "language": "ar"}}}
++{"seq": 77, "dir": "tx", "t_mono_ns": 627405750358, "stream_ms": 166000, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 166000, "text": "السلام عليكم، معك سلمى من عيادات رِفاه. معي الأستاذ عبدالرحمن؟", "duration_ms": 5320}}
++{"seq": 78, "dir": "rx", "t_mono_ns": 631406870961, "stream_ms": 170002.37, "msg": {"type": "pong", "id": 35}}
++{"seq": 79, "dir": "tx", "t_mono_ns": 632724847372, "stream_ms": 171320, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 171320}}
++{"seq": 80, "dir": "tx", "t_mono_ns": 634925019958, "stream_ms": 173520, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 173530, "text": "حياك الله. وش أنسب وقت نتصل عليك فيه عشان نأكد موعد التحاليل؟", "duration_ms": 5210}}
++{"seq": 81, "dir": "rx", "t_mono_ns": 636406082410, "stream_ms": 175001.58, "msg": {"type": "pong", "id": 36}}
++{"seq": 82, "dir": "tx", "t_mono_ns": 640145779879, "stream_ms": 178740, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 178740}}
++{"seq": 83, "dir": "rx", "t_mono_ns": 641406601929, "stream_ms": 180002.1, "msg": {"type": "pong", "id": 37}}
++{"seq": 84, "dir": "rx", "t_mono_ns": 646407247195, "stream_ms": 185002.74, "msg": {"type": "pong", "id": 38}}
++{"seq": 85, "dir": "rx", "t_mono_ns": 651406326434, "stream_ms": 190001.83, "msg": {"type": "pong", "id": 39}}
++{"seq": 86, "dir": "tx", "t_mono_ns": 651785821151, "stream_ms": 190380, "msg": {"type": "scenario_end", "scenario_id": "HT-D01", "stream_ms": 190380}}
++{"seq": 87, "dir": "tx", "t_mono_ns": 653285639847, "stream_ms": 191880, "msg": {"type": "scenario_start", "scenario_id": "HT-D02", "stream_ms": 191880, "context": {"use_case": "order number", "language": "ar"}}}
++{"seq": 88, "dir": "tx", "t_mono_ns": 653585617982, "stream_ms": 192180, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 192180, "text": "أهلين، معك فيصل من مِرسال. معي الأستاذة لمى؟", "duration_ms": 4060}}
++{"seq": 89, "dir": "rx", "t_mono_ns": 656406276863, "stream_ms": 195001.78, "msg": {"type": "pong", "id": 40}}
++{"seq": 90, "dir": "tx", "t_mono_ns": 657645373328, "stream_ms": 196240, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 196240}}
++{"seq": 91, "dir": "tx", "t_mono_ns": 659364949292, "stream_ms": 197960, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 197970, "text": "ممكن تعطيني رقم الطلب لو سمحتي؟ هو سبع أرقام، تلقينه في رسالة التأكيد.", "duration_ms": 5170}}
++{"seq": 92, "dir": "rx", "t_mono_ns": 661406323138, "stream_ms": 200001.83, "msg": {"type": "pong", "id": 41}}
++{"seq": 93, "dir": "tx", "t_mono_ns": 664545570112, "stream_ms": 203140, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 203140}}
++{"seq": 94, "dir": "rx", "t_mono_ns": 666406826952, "stream_ms": 205002.33, "msg": {"type": "pong", "id": 42}}
++{"seq": 95, "dir": "rx", "t_mono_ns": 671406109576, "stream_ms": 210001.62, "msg": {"type": "pong", "id": 43}}
++{"seq": 96, "dir": "rx", "t_mono_ns": 676406439151, "stream_ms": 215001.94, "msg": {"type": "pong", "id": 44}}
++{"seq": 97, "dir": "rx", "t_mono_ns": 681406483665, "stream_ms": 220001.99, "msg": {"type": "pong", "id": 45}}
++{"seq": 98, "dir": "tx", "t_mono_ns": 683185254598, "stream_ms": 221780, "msg": {"type": "scenario_end", "scenario_id": "HT-D02", "stream_ms": 221780}}
++{"seq": 99, "dir": "tx", "t_mono_ns": 684685063283, "stream_ms": 223280, "msg": {"type": "scenario_start", "scenario_id": "HT-D03", "stream_ms": 223280, "context": {"use_case": "delivery options", "language": "ar"}}}
++{"seq": 100, "dir": "tx", "t_mono_ns": 684989029098, "stream_ms": 223580, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 223580, "text": "هلا، معك ريم من متجر نوّار. معي الأستاذة جود؟", "duration_ms": 4280}}
++{"seq": 101, "dir": "rx", "t_mono_ns": 686406448032, "stream_ms": 225001.95, "msg": {"type": "pong", "id": 46}}
++{"seq": 102, "dir": "tx", "t_mono_ns": 689265764965, "stream_ms": 227860, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 227860}}
++{"seq": 103, "dir": "tx", "t_mono_ns": 690965289948, "stream_ms": 229560, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 229570, "text": "حياك الله. عندنا ثلاث خيارات للتوصيل: العادي خلال ثلاث إلى خمس أيام ومجاني، والسريع بكرة برسوم خمسة وعشرين ريال، أو تستلمينه من الفرع بنفس اليوم، وكل الخيارات تقدرين تتابعينها من التطبيق.", "duration_ms": 16170}}
++{"seq": 104, "dir": "rx", "t_mono_ns": 691405946439, "stream_ms": 230001.45, "msg": {"type": "pong", "id": 47}}
++{"seq": 105, "dir": "rx", "t_mono_ns": 696406458433, "stream_ms": 235001.9, "msg": {"type": "pong", "id": 48}}
++{"seq": 106, "dir": "rx", "t_mono_ns": 701406722113, "stream_ms": 240002.21, "msg": {"type": "pong", "id": 49}}
++{"seq": 107, "dir": "rx", "t_mono_ns": 706406308920, "stream_ms": 245001.81, "msg": {"type": "pong", "id": 50}}
++{"seq": 108, "dir": "tx", "t_mono_ns": 707145463128, "stream_ms": 245740, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 245740}}
++{"seq": 109, "dir": "tx", "t_mono_ns": 709145226526, "stream_ms": 247740, "msg": {"type": "scenario_end", "scenario_id": "HT-D03", "stream_ms": 247740}}
++{"seq": 110, "dir": "tx", "t_mono_ns": 710645075585, "stream_ms": 249240, "msg": {"type": "scenario_start", "scenario_id": "BG-D01", "stream_ms": 249240, "context": {"use_case": "plan offer", "language": "ar"}}}
++{"seq": 111, "dir": "tx", "t_mono_ns": 710945794918, "stream_ms": 249540, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 249540, "text": "السلام عليكم، معك خالد من سَنا للاتصالات. معي الأستاذ تركي؟", "duration_ms": 4500}}
++{"seq": 112, "dir": "rx", "t_mono_ns": 711406290815, "stream_ms": 250001.8, "msg": {"type": "pong", "id": 51}}
++{"seq": 113, "dir": "tx", "t_mono_ns": 715445790271, "stream_ms": 254040, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 254040}}
++{"seq": 114, "dir": "rx", "t_mono_ns": 716406922796, "stream_ms": 255002.42, "msg": {"type": "pong", "id": 52}}
++{"seq": 115, "dir": "tx", "t_mono_ns": 716884968738, "stream_ms": 255480, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 255490, "text": "حياك الله. عندك عرض على باقة الألياف المنزلية، سرعة خمس مية ميقا، وأول شهرين بنص السعر، والتركيب مجاني، وتقدر تحدد موعد الفني اللي يناسبك من التطبيق.", "duration_ms": 12930}}
++{"seq": 116, "dir": "rx", "t_mono_ns": 721413025269, "stream_ms": 260008.53, "msg": {"type": "pong", "id": 53}}
++{"seq": 117, "dir": "rx", "t_mono_ns": 725246350700, "stream_ms": 263841.86, "msg": {"type": "decision", "decision": "STOP"}}
++{"seq": 118, "dir": "rx", "t_mono_ns": 726406685379, "stream_ms": 265002.19, "msg": {"type": "pong", "id": 54}}
++{"seq": 119, "dir": "tx", "t_mono_ns": 729825780764, "stream_ms": 268420, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 268420}}
++{"seq": 120, "dir": "rx", "t_mono_ns": 731406545779, "stream_ms": 270002.05, "msg": {"type": "pong", "id": 55}}
++{"seq": 121, "dir": "tx", "t_mono_ns": 731825169557, "stream_ms": 270420, "msg": {"type": "scenario_end", "scenario_id": "BG-D01", "stream_ms": 270420}}
++{"seq": 122, "dir": "tx", "t_mono_ns": 733325425771, "stream_ms": 271920, "msg": {"type": "scenario_start", "scenario_id": "BG-D02", "stream_ms": 271920, "context": {"use_case": "car service booking", "language": "ar"}}}
++{"seq": 123, "dir": "tx", "t_mono_ns": 733625607197, "stream_ms": 272220, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 272220, "text": "هلا، معك نوف من مركز صيانة الوادي. معي الأستاذ بدر؟", "duration_ms": 4390}}
++{"seq": 124, "dir": "rx", "t_mono_ns": 736406339835, "stream_ms": 275001.84, "msg": {"type": "pong", "id": 56}}
++{"seq": 125, "dir": "tx", "t_mono_ns": 738025471350, "stream_ms": 276620, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 276610}}
++{"seq": 126, "dir": "tx", "t_mono_ns": 740805763733, "stream_ms": 279400, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 279410, "text": "حياك الله. سيارتك عليها صيانة العشرين ألف كيلو، وعندنا مواعيد متاحة يوم الأربعاء والخميس، والصيانة تاخذ تقريباً ساعتين، وفيه خصم عشرة بالمية لو حجزت هالأسبوع، وتقدر تحجز من التطبيق أو ترد على هالرقم.", "duration_ms": 16370}}
++{"seq": 127, "dir": "rx", "t_mono_ns": 741407435742, "stream_ms": 280002.94, "msg": {"type": "pong", "id": 57}}
++{"seq": 128, "dir": "rx", "t_mono_ns": 746407229398, "stream_ms": 285002.73, "msg": {"type": "pong", "id": 58}}
++{"seq": 129, "dir": "rx", "t_mono_ns": 751406445160, "stream_ms": 290001.95, "msg": {"type": "pong", "id": 59}}
++{"seq": 130, "dir": "rx", "t_mono_ns": 756407092249, "stream_ms": 295002.6, "msg": {"type": "pong", "id": 60}}
++{"seq": 131, "dir": "tx", "t_mono_ns": 757185492153, "stream_ms": 295780, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 295780}}
++{"seq": 132, "dir": "tx", "t_mono_ns": 759185115661, "stream_ms": 297780, "msg": {"type": "scenario_end", "scenario_id": "BG-D02", "stream_ms": 297780}}
++{"seq": 133, "dir": "tx", "t_mono_ns": 760685100873, "stream_ms": 299280, "msg": {"type": "scenario_start", "scenario_id": "BG-D03", "stream_ms": 299280, "context": {"use_case": "clinic follow-up", "language": "ar"}}}
++{"seq": 134, "dir": "tx", "t_mono_ns": 760985658988, "stream_ms": 299580, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 299580, "text": "مساء الخير، معك سلمى من عيادات رِفاه. معي أم عبدالله؟", "duration_ms": 4730}}
++{"seq": 135, "dir": "rx", "t_mono_ns": 761406599174, "stream_ms": 300002.1, "msg": {"type": "pong", "id": 61}}
++{"seq": 136, "dir": "tx", "t_mono_ns": 765725458204, "stream_ms": 304320, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 304310}}
++{"seq": 137, "dir": "rx", "t_mono_ns": 766407480089, "stream_ms": 305002.98, "msg": {"type": "pong", "id": 62}}
++{"seq": 138, "dir": "tx", "t_mono_ns": 767925062104, "stream_ms": 306520, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 306520, "text": "أهلين. حبيت أبلغك إن نتايج التحاليل طلعت، والدكتور حاب يشوفك الأسبوع الجاي عشان يشرح لك النتايج، وعندنا موعد الثلاثاء الساعة أربع أو الأربعاء الساعة عشرة الصبح.", "duration_ms": 13260}}
++{"seq": 139, "dir": "rx", "t_mono_ns": 771406662261, "stream_ms": 310002.17, "msg": {"type": "pong", "id": 63}}
++{"seq": 140, "dir": "rx", "t_mono_ns": 776406608351, "stream_ms": 315002.11, "msg": {"type": "pong", "id": 64}}
++{"seq": 141, "dir": "tx", "t_mono_ns": 781185797353, "stream_ms": 319780, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 319780}}
++{"seq": 142, "dir": "rx", "t_mono_ns": 781407392055, "stream_ms": 320002.89, "msg": {"type": "pong", "id": 65}}
++{"seq": 143, "dir": "tx", "t_mono_ns": 783185473029, "stream_ms": 321780, "msg": {"type": "scenario_end", "scenario_id": "BG-D03", "stream_ms": 321780}}
++{"seq": 144, "dir": "tx", "t_mono_ns": 784685206136, "stream_ms": 323280, "msg": {"type": "scenario_start", "scenario_id": "NV-D01", "stream_ms": 323280, "context": {"use_case": "delivery address check", "language": "ar"}}}
++{"seq": 145, "dir": "tx", "t_mono_ns": 784985781292, "stream_ms": 323580, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 323580, "text": "هلا، معك فيصل من مِرسال. أكلّم الأستاذ سلطان؟", "duration_ms": 3460}}
++{"seq": 146, "dir": "rx", "t_mono_ns": 786406771219, "stream_ms": 325002.27, "msg": {"type": "pong", "id": 66}}
++{"seq": 147, "dir": "tx", "t_mono_ns": 788445446190, "stream_ms": 327040, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 327040}}
++{"seq": 148, "dir": "tx", "t_mono_ns": 789744960999, "stream_ms": 328340, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 328350, "text": "يا هلا. بس أبي أتأكد من العنوان: حي النرجس، شارع الأمير سعود، فيلا رقم اثنعش، وجنبها مسجد، عشان المندوب ما يتوه ويوصلك على طول.", "duration_ms": 12150}}
++{"seq": 149, "dir": "rx", "t_mono_ns": 791407014419, "stream_ms": 330002.52, "msg": {"type": "pong", "id": 67}}
++{"seq": 150, "dir": "rx", "t_mono_ns": 796406907786, "stream_ms": 335002.41, "msg": {"type": "pong", "id": 68}}
++{"seq": 151, "dir": "rx", "t_mono_ns": 801406590976, "stream_ms": 340002.09, "msg": {"type": "pong", "id": 69}}
++{"seq": 152, "dir": "tx", "t_mono_ns": 801905581896, "stream_ms": 340500, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 340500}}
++{"seq": 153, "dir": "tx", "t_mono_ns": 803905765638, "stream_ms": 342500, "msg": {"type": "scenario_end", "scenario_id": "NV-D01", "stream_ms": 342500}}
++{"seq": 154, "dir": "tx", "t_mono_ns": 805404975088, "stream_ms": 344000, "msg": {"type": "scenario_start", "scenario_id": "NV-D02", "stream_ms": 344000, "context": {"use_case": "survey intro", "language": "ar"}}}
++{"seq": 155, "dir": "tx", "t_mono_ns": 805705191184, "stream_ms": 344300, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 344300, "text": "أهلين، معك ريم من متجر نوّار. معي الأستاذة رهف؟", "duration_ms": 4740}}
++{"seq": 156, "dir": "rx", "t_mono_ns": 806406334805, "stream_ms": 345001.84, "msg": {"type": "pong", "id": 70}}
++{"seq": 157, "dir": "tx", "t_mono_ns": 810445818880, "stream_ms": 349040, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 349040}}
++{"seq": 158, "dir": "rx", "t_mono_ns": 811407215225, "stream_ms": 350002.72, "msg": {"type": "pong", "id": 71}}
++{"seq": 159, "dir": "tx", "t_mono_ns": 812124879131, "stream_ms": 350720, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 350720, "text": "أهلين رهف. عندنا استبيان قصير مرة، والله ما ياخذ أكثر من دقيقة، وأوعدك ما راح أسألك عن رقم جوالك ولا عن عمرك، بس عن تجربتك مع آخر طلب.", "duration_ms": 11280}}
++{"seq": 160, "dir": "rx", "t_mono_ns": 816406431708, "stream_ms": 355001.93, "msg": {"type": "pong", "id": 72}}
++{"seq": 161, "dir": "rx", "t_mono_ns": 821406546413, "stream_ms": 360002.05, "msg": {"type": "pong", "id": 73}}
++{"seq": 162, "dir": "tx", "t_mono_ns": 823405058953, "stream_ms": 362000, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 362000}}
++{"seq": 163, "dir": "tx", "t_mono_ns": 825405786785, "stream_ms": 364000, "msg": {"type": "scenario_end", "scenario_id": "NV-D02", "stream_ms": 364000}}
++{"seq": 164, "dir": "rx", "t_mono_ns": 826405916909, "stream_ms": 365001.42, "msg": {"type": "pong", "id": 74}}
++{"seq": 165, "dir": "tx", "t_mono_ns": 826905788861, "stream_ms": 365500, "msg": {"type": "scenario_start", "scenario_id": "NV-D03", "stream_ms": 365500, "context": {"use_case": "plan change confirmation", "language": "ar"}}}
++{"seq": 166, "dir": "tx", "t_mono_ns": 827205782020, "stream_ms": 365800, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 365800, "text": "هلا، معك خالد من سَنا للاتصالات. معي الأستاذ يزيد؟", "duration_ms": 3570}}
++{"seq": 167, "dir": "tx", "t_mono_ns": 830785582602, "stream_ms": 369380, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 369370}}
++{"seq": 168, "dir": "rx", "t_mono_ns": 831407177240, "stream_ms": 370002.68, "msg": {"type": "pong", "id": 75}}
++{"seq": 169, "dir": "tx", "t_mono_ns": 832485676242, "stream_ms": 371080, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 371080, "text": "يا هلا. تم تغيير باقتك للباقة الجديدة، والتغيير بيصير فعّال من بداية الشهر الجاي، وبتوصلك رسالة فيها التفاصيل، وما فيه أي رسوم إضافية على التغيير.", "duration_ms": 12050}}
++{"seq": 170, "dir": "rx", "t_mono_ns": 836406654394, "stream_ms": 375002.16, "msg": {"type": "pong", "id": 76}}
++{"seq": 171, "dir": "rx", "t_mono_ns": 841407236487, "stream_ms": 380002.74, "msg": {"type": "pong", "id": 77}}
++{"seq": 172, "dir": "tx", "t_mono_ns": 844545260109, "stream_ms": 383140, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 383130}}
++{"seq": 173, "dir": "rx", "t_mono_ns": 846406319855, "stream_ms": 385001.82, "msg": {"type": "pong", "id": 78}}
++{"seq": 174, "dir": "tx", "t_mono_ns": 846545566381, "stream_ms": 385140, "msg": {"type": "scenario_end", "scenario_id": "NV-D03", "stream_ms": 385140}}
++{"seq": 175, "dir": "tx", "t_mono_ns": 848045436810, "stream_ms": 386640, "msg": {"type": "scenario_start", "scenario_id": "AM-D01", "stream_ms": 386640, "context": {"use_case": "payment reminder", "language": "ar"}}}
++{"seq": 176, "dir": "tx", "t_mono_ns": 848345905555, "stream_ms": 386940, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 386940, "text": "السلام عليكم، معك ريم من متجر نوّار. معي الأستاذ عمر؟", "duration_ms": 4900}}
++{"seq": 177, "dir": "rx", "t_mono_ns": 851406780628, "stream_ms": 390002.29, "msg": {"type": "pong", "id": 79}}
++{"seq": 178, "dir": "tx", "t_mono_ns": 853245130493, "stream_ms": 391840, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 391840}}
++{"seq": 179, "dir": "tx", "t_mono_ns": 855165402958, "stream_ms": 393760, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 393760, "text": "حياك الله. حبيت أذكرك إن عندك دفعة بقيمة ثلاث مية وخمسين ريال مستحقة يوم الخميس، وتقدر تسددها من التطبيق أو من الرابط اللي بيوصلك برسالة، وإذا عندك أي استفسار أنا موجودة.", "duration_ms": 13570}}
++{"seq": 180, "dir": "rx", "t_mono_ns": 856406007846, "stream_ms": 395001.51, "msg": {"type": "pong", "id": 80}}
++{"seq": 181, "dir": "rx", "t_mono_ns": 861406852997, "stream_ms": 400002.35, "msg": {"type": "pong", "id": 81}}
++{"seq": 182, "dir": "rx", "t_mono_ns": 866406558060, "stream_ms": 405002.06, "msg": {"type": "pong", "id": 82}}
++{"seq": 183, "dir": "tx", "t_mono_ns": 868745302566, "stream_ms": 407340, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 407330}}
++{"seq": 184, "dir": "tx", "t_mono_ns": 870745581465, "stream_ms": 409340, "msg": {"type": "scenario_end", "scenario_id": "AM-D01", "stream_ms": 409340}}
++{"seq": 185, "dir": "rx", "t_mono_ns": 871406026525, "stream_ms": 410001.52, "msg": {"type": "pong", "id": 83}}
++{"seq": 186, "dir": "tx", "t_mono_ns": 872245617673, "stream_ms": 410840, "msg": {"type": "scenario_start", "scenario_id": "AM-D02", "stream_ms": 410840, "context": {"use_case": "payment reminder", "language": "ar"}}}
++{"seq": 187, "dir": "tx", "t_mono_ns": 872545292849, "stream_ms": 411140, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 411140, "text": "السلام عليكم، معك ريم من متجر نوّار. معي الأستاذ مشعل؟", "duration_ms": 4880}}
++{"seq": 188, "dir": "rx", "t_mono_ns": 876406955580, "stream_ms": 415002.45, "msg": {"type": "pong", "id": 84}}
++{"seq": 189, "dir": "tx", "t_mono_ns": 877425443709, "stream_ms": 416020, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 416020}}
++{"seq": 190, "dir": "tx", "t_mono_ns": 878685198745, "stream_ms": 417280, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 417280, "text": "حياك الله. حبيت أذكرك إن عندك دفعة مستحقة يوم الخميس، وتقدر تسددها من التطبيق أو من الرابط اللي بيوصلك برسالة، وإذا سددت قبل الموعد ما فيه أي رسوم.", "duration_ms": 12840}}
++{"seq": 191, "dir": "rx", "t_mono_ns": 881406133533, "stream_ms": 420001.64, "msg": {"type": "pong", "id": 85}}
++{"seq": 192, "dir": "rx", "t_mono_ns": 885607175748, "stream_ms": 424202.69, "msg": {"type": "decision", "decision": "STOP"}}
++{"seq": 193, "dir": "rx", "t_mono_ns": 886406996139, "stream_ms": 425002.5, "msg": {"type": "pong", "id": 86}}
++{"seq": 194, "dir": "rx", "t_mono_ns": 891406937362, "stream_ms": 430002.44, "msg": {"type": "pong", "id": 87}}
++{"seq": 195, "dir": "tx", "t_mono_ns": 891524861941, "stream_ms": 430120, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 430120}}
++{"seq": 196, "dir": "tx", "t_mono_ns": 893525476702, "stream_ms": 432120, "msg": {"type": "scenario_end", "scenario_id": "AM-D02", "stream_ms": 432120}}
++{"seq": 197, "dir": "tx", "t_mono_ns": 895025800748, "stream_ms": 433620, "msg": {"type": "scenario_start", "scenario_id": "AM-D03", "stream_ms": 433620, "context": {"use_case": "terms explanation", "language": "ar"}}}
++{"seq": 198, "dir": "tx", "t_mono_ns": 895325405610, "stream_ms": 433920, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 433920, "text": "هلا، معك عبدالله من البنك. أكلّم الأستاذ فيصل؟", "duration_ms": 3720}}
++{"seq": 199, "dir": "rx", "t_mono_ns": 896406842475, "stream_ms": 435002.35, "msg": {"type": "pong", "id": 88}}
++{"seq": 200, "dir": "tx", "t_mono_ns": 899045316695, "stream_ms": 437640, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 437640}}
++{"seq": 201, "dir": "tx", "t_mono_ns": 900427958031, "stream_ms": 439020, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 439020, "text": "يا هلا. زي ما ذكرت لك قبل شوي، الرسوم السنوية مجانية أول سنة، وبعدها مية وخمسين ريال، يعني أول سنة ما راح تدفع شي، وبعد السنة الأولى تصير الرسوم مية وخمسين ريال، وتقدر تلغي البطاقة قبل نهاية السنة بدون أي رسوم.", "duration_ms": 16580}}
++{"seq": 202, "dir": "rx", "t_mono_ns": 901407426870, "stream_ms": 440002.93, "msg": {"type": "pong", "id": 89}}
++{"seq": 203, "dir": "rx", "t_mono_ns": 906407928145, "stream_ms": 445003.43, "msg": {"type": "pong", "id": 90}}
++{"seq": 204, "dir": "rx", "t_mono_ns": 910447329596, "stream_ms": 449042.84, "msg": {"type": "decision", "decision": "STOP"}}
++{"seq": 205, "dir": "rx", "t_mono_ns": 911406650667, "stream_ms": 450002.15, "msg": {"type": "pong", "id": 91}}
++{"seq": 206, "dir": "rx", "t_mono_ns": 916406639561, "stream_ms": 455002.14, "msg": {"type": "pong", "id": 92}}
++{"seq": 207, "dir": "tx", "t_mono_ns": 917006672534, "stream_ms": 455600, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 455600}}
++{"seq": 208, "dir": "tx", "t_mono_ns": 919005496123, "stream_ms": 457600, "msg": {"type": "scenario_end", "scenario_id": "AM-D03", "stream_ms": 457600}}
++{"seq": 209, "dir": "tx", "t_mono_ns": 920506644249, "stream_ms": 459100, "msg": {"type": "scenario_start", "scenario_id": "OV-D01", "stream_ms": 459100, "context": {"use_case": "appointment booking", "language": "ar"}}}
++{"seq": 210, "dir": "tx", "t_mono_ns": 920805565692, "stream_ms": 459400, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 459400, "text": "هلا، معك نوف من مركز صيانة الوادي. معي الأستاذ راكان؟", "duration_ms": 4450}}
++{"seq": 211, "dir": "rx", "t_mono_ns": 921407303062, "stream_ms": 460002.8, "msg": {"type": "pong", "id": 93}}
++{"seq": 212, "dir": "tx", "t_mono_ns": 925264907314, "stream_ms": 463860, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 463850}}
++{"seq": 213, "dir": "rx", "t_mono_ns": 926406970829, "stream_ms": 465002.47, "msg": {"type": "pong", "id": 94}}
++{"seq": 214, "dir": "tx", "t_mono_ns": 926685748394, "stream_ms": 465280, "msg": {"type": "agent_utterance_start", "utt_id": "A1a", "stream_ms": 465290, "text": "تحب أحجز لك موعد يوم الأحد الساعة عشرة الصبح؟", "duration_ms": 3130}}
++{"seq": 215, "dir": "tx", "t_mono_ns": 929824946937, "stream_ms": 468420, "msg": {"type": "agent_utterance_end", "utt_id": "A1a", "stream_ms": 468420}}
++{"seq": 216, "dir": "tx", "t_mono_ns": 930725106913, "stream_ms": 469320, "msg": {"type": "agent_utterance_start", "utt_id": "A1b", "stream_ms": 469320, "text": "وإذا ما يناسبك عندنا كمان يوم الثلاثاء بعد الظهر، ويوم الخميس من الساعة ثمان الصبح، وكل المواعيد فيها فحص مجاني.", "duration_ms": 8820}}
++{"seq": 217, "dir": "rx", "t_mono_ns": 931406842093, "stream_ms": 470002.34, "msg": {"type": "pong", "id": 95}}
++{"seq": 218, "dir": "rx", "t_mono_ns": 931767746135, "stream_ms": 470363.26, "msg": {"type": "decision", "decision": "STOP"}}
++{"seq": 219, "dir": "rx", "t_mono_ns": 936409235195, "stream_ms": 475004.74, "msg": {"type": "pong", "id": 96}}
++{"seq": 220, "dir": "tx", "t_mono_ns": 939545528232, "stream_ms": 478140, "msg": {"type": "agent_utterance_end", "utt_id": "A1b", "stream_ms": 478140}}
++{"seq": 221, "dir": "rx", "t_mono_ns": 941406959538, "stream_ms": 480002.46, "msg": {"type": "pong", "id": 97}}
++{"seq": 222, "dir": "tx", "t_mono_ns": 941545868124, "stream_ms": 480140, "msg": {"type": "scenario_end", "scenario_id": "OV-D01", "stream_ms": 480140}}
++{"seq": 223, "dir": "tx", "t_mono_ns": 943045783096, "stream_ms": 481640, "msg": {"type": "scenario_start", "scenario_id": "OV-D02", "stream_ms": 481640, "context": {"use_case": "document request", "language": "ar"}}}
++{"seq": 224, "dir": "tx", "t_mono_ns": 943345256868, "stream_ms": 481940, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 481940, "text": "أهلين، معك سارة من البنك. معي الأستاذة أمل؟", "duration_ms": 3610}}
++{"seq": 225, "dir": "rx", "t_mono_ns": 946406486700, "stream_ms": 485001.98, "msg": {"type": "pong", "id": 98}}
++{"seq": 226, "dir": "tx", "t_mono_ns": 946965111637, "stream_ms": 485560, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 485550}}
++{"seq": 227, "dir": "tx", "t_mono_ns": 948505901449, "stream_ms": 487100, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 487100, "text": "حياك الله. عشان نكمل طلب التمويل نحتاج منك صورة من الهوية الوطنية سارية المفعول، وتعريف بالراتب ما يكون أقدم من شهر، وكشف حساب لآخر ثلاث شهور.", "duration_ms": 11990}}
++{"seq": 228, "dir": "rx", "t_mono_ns": 951407045562, "stream_ms": 490002.55, "msg": {"type": "pong", "id": 99}}
++{"seq": 229, "dir": "rx", "t_mono_ns": 956407353016, "stream_ms": 495002.85, "msg": {"type": "pong", "id": 100}}
++{"seq": 230, "dir": "tx", "t_mono_ns": 960505906954, "stream_ms": 499100, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 499090}}
++{"seq": 231, "dir": "rx", "t_mono_ns": 961406137604, "stream_ms": 500001.64, "msg": {"type": "pong", "id": 101}}
++{"seq": 232, "dir": "tx", "t_mono_ns": 962505599774, "stream_ms": 501100, "msg": {"type": "scenario_end", "scenario_id": "OV-D02", "stream_ms": 501100}}
++{"seq": 233, "dir": "tx", "t_mono_ns": 964006008923, "stream_ms": 502600, "msg": {"type": "scenario_start", "scenario_id": "OV-D03", "stream_ms": 502600, "context": {"use_case": "complaint follow-up", "language": "ar"}}}
++{"seq": 234, "dir": "tx", "t_mono_ns": 964304986374, "stream_ms": 502900, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 502900, "text": "هلا، معك خالد من سَنا للاتصالات. معي الأستاذ فهد؟", "duration_ms": 4220}}
++{"seq": 235, "dir": "rx", "t_mono_ns": 966406459599, "stream_ms": 505001.96, "msg": {"type": "pong", "id": 102}}
++{"seq": 236, "dir": "tx", "t_mono_ns": 968525739707, "stream_ms": 507120, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 507120}}
++{"seq": 237, "dir": "tx", "t_mono_ns": 969845581178, "stream_ms": 508440, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 508450, "text": "يا هلا. بخصوص البلاغ اللي رفعته عن ضعف الشبكة، حبيت أبلغك إن الفريق الفني يشتغل عليه، والمدة المتوقعة للحل من ثلاث إلى خمس أيام عمل، وبنرسل لك رسالة أول ما ينحل، ونعتذر منك على الإزعاج.", "duration_ms": 14580}}
++{"seq": 238, "dir": "rx", "t_mono_ns": 971407780348, "stream_ms": 510003.28, "msg": {"type": "pong", "id": 103}}
++{"seq": 239, "dir": "rx", "t_mono_ns": 976406512378, "stream_ms": 515002.01, "msg": {"type": "pong", "id": 104}}
++{"seq": 240, "dir": "rx", "t_mono_ns": 976666132364, "stream_ms": 515261.64, "msg": {"type": "decision", "decision": "STOP"}}
++{"seq": 241, "dir": "rx", "t_mono_ns": 981406112080, "stream_ms": 520001.62, "msg": {"type": "pong", "id": 105}}
++{"seq": 242, "dir": "tx", "t_mono_ns": 984445051496, "stream_ms": 523040, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 523030}}
++{"seq": 243, "dir": "rx", "t_mono_ns": 986406325896, "stream_ms": 525001.82, "msg": {"type": "pong", "id": 106}}
++{"seq": 244, "dir": "tx", "t_mono_ns": 986445327249, "stream_ms": 525040, "msg": {"type": "scenario_end", "scenario_id": "OV-D03", "stream_ms": 525040}}
++{"seq": 245, "dir": "tx", "t_mono_ns": 987945751132, "stream_ms": 526540, "msg": {"type": "scenario_start", "scenario_id": "DV-D01", "stream_ms": 526540, "context": {"use_case": "delivery confirmation", "language": "ar"}}}
++{"seq": 246, "dir": "tx", "t_mono_ns": 988245780442, "stream_ms": 526840, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 526840, "text": "هلا، معك فيصل من مِرسال. معي الأخ عبدالله؟", "duration_ms": 3480}}
++{"seq": 247, "dir": "rx", "t_mono_ns": 991406235010, "stream_ms": 530001.74, "msg": {"type": "pong", "id": 107}}
++{"seq": 248, "dir": "tx", "t_mono_ns": 991725471632, "stream_ms": 530320, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 530320}}
++{"seq": 249, "dir": "tx", "t_mono_ns": 993405438350, "stream_ms": 532000, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 532000, "text": "يا هلا. طلبك طلع من المستودع اليوم الصبح، والمفروض يوصلك خلال يومين، والمندوب بيتواصل معك على نفس الرقم، ولو ما رديت عليه بيحاول مرة ثانية بعد ساعة.", "duration_ms": 12100}}
++{"seq": 250, "dir": "rx", "t_mono_ns": 996407389086, "stream_ms": 535002.88, "msg": {"type": "pong", "id": 108}}
++{"seq": 251, "dir": "rx", "t_mono_ns": 1001406661652, "stream_ms": 540002.16, "msg": {"type": "pong", "id": 109}}
++{"seq": 252, "dir": "tx", "t_mono_ns": 1005505602430, "stream_ms": 544100, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 544100}}
++{"seq": 253, "dir": "rx", "t_mono_ns": 1006406394951, "stream_ms": 545001.9, "msg": {"type": "pong", "id": 110}}
++{"seq": 254, "dir": "tx", "t_mono_ns": 1007505152329, "stream_ms": 546100, "msg": {"type": "scenario_end", "scenario_id": "DV-D01", "stream_ms": 546100}}
++{"seq": 255, "dir": "tx", "t_mono_ns": 1009005713414, "stream_ms": 547600, "msg": {"type": "scenario_start", "scenario_id": "DV-D02", "stream_ms": 547600, "context": {"use_case": "car service reminder", "language": "ar"}}}
++{"seq": 256, "dir": "tx", "t_mono_ns": 1009305842670, "stream_ms": 547900, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 547900, "text": "مساء الخير، معك نوف من مركز صيانة الوادي. معي الأخ حمد؟", "duration_ms": 4800}}
++{"seq": 257, "dir": "rx", "t_mono_ns": 1011406460699, "stream_ms": 550001.96, "msg": {"type": "pong", "id": 111}}
++{"seq": 258, "dir": "tx", "t_mono_ns": 1014105639574, "stream_ms": 552700, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 552700}}
++{"seq": 259, "dir": "tx", "t_mono_ns": 1016365584454, "stream_ms": 554960, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 554960, "text": "أهلين. حبيت أذكرك إن موعد تغيير الزيت لسيارتك بكرة الساعة تسع الصبح، والفحص بيشمل الفرامل والإطارات، والمدة تقريباً ساعة، وإذا تبي نغير الموعد كلمنا قبلها بيوم.", "duration_ms": 13700}}
++{"seq": 260, "dir": "rx", "t_mono_ns": 1016407210613, "stream_ms": 555002.71, "msg": {"type": "pong", "id": 112}}
++{"seq": 261, "dir": "rx", "t_mono_ns": 1021406433453, "stream_ms": 560001.94, "msg": {"type": "pong", "id": 113}}
++{"seq": 262, "dir": "rx", "t_mono_ns": 1026406587911, "stream_ms": 565002.08, "msg": {"type": "pong", "id": 114}}
++{"seq": 263, "dir": "tx", "t_mono_ns": 1030065760080, "stream_ms": 568660, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 568660}}
++{"seq": 264, "dir": "rx", "t_mono_ns": 1031406805135, "stream_ms": 570002.3, "msg": {"type": "pong", "id": 115}}
++{"seq": 265, "dir": "tx", "t_mono_ns": 1032065358052, "stream_ms": 570660, "msg": {"type": "scenario_end", "scenario_id": "DV-D02", "stream_ms": 570660}}
++{"seq": 266, "dir": "tx", "t_mono_ns": 1033565617434, "stream_ms": 572160, "msg": {"type": "scenario_start", "scenario_id": "DV-D03", "stream_ms": 572160, "context": {"use_case": "unwanted order", "language": "ar"}}}
++{"seq": 267, "dir": "tx", "t_mono_ns": 1033865207622, "stream_ms": 572460, "msg": {"type": "agent_utterance_start", "utt_id": "A0", "stream_ms": 572460, "text": "هلا، معك خالد من متجر نوّار. معي الأخ بدر؟", "duration_ms": 4100}}
++{"seq": 268, "dir": "rx", "t_mono_ns": 1036408264823, "stream_ms": 575003.76, "msg": {"type": "pong", "id": 116}}
++{"seq": 269, "dir": "tx", "t_mono_ns": 1037964934687, "stream_ms": 576560, "msg": {"type": "agent_utterance_end", "utt_id": "A0", "stream_ms": 576560}}
++{"seq": 270, "dir": "tx", "t_mono_ns": 1039364915525, "stream_ms": 577960, "msg": {"type": "agent_utterance_start", "utt_id": "A1", "stream_ms": 577960, "text": "يا هلا. حبيت أأكد معك طلب الاشتراك الشهري بخدمة التوصيل المجاني، والاشتراك بيتجدد تلقائياً كل شهر بتسعة وعشرين ريال، وتقدر تلغيه أي وقت من التطبيق.", "duration_ms": 12060}}
++{"seq": 271, "dir": "rx", "t_mono_ns": 1041406521266, "stream_ms": 580002.02, "msg": {"type": "pong", "id": 117}}
++{"seq": 272, "dir": "rx", "t_mono_ns": 1045753264128, "stream_ms": 584348.78, "msg": {"type": "decision", "decision": "STOP"}}
++{"seq": 273, "dir": "rx", "t_mono_ns": 1046406273141, "stream_ms": 585001.77, "msg": {"type": "pong", "id": 118}}
++{"seq": 274, "dir": "rx", "t_mono_ns": 1051406480332, "stream_ms": 590001.98, "msg": {"type": "pong", "id": 119}}
++{"seq": 275, "dir": "tx", "t_mono_ns": 1051425914000, "stream_ms": 590020, "msg": {"type": "agent_utterance_end", "utt_id": "A1", "stream_ms": 590020}}
++{"seq": 276, "dir": "tx", "t_mono_ns": 1053425814909, "stream_ms": 592020, "msg": {"type": "scenario_end", "scenario_id": "DV-D03", "stream_ms": 592020}}
++{"seq": 277, "dir": "tx", "t_mono_ns": 1054405264694, "stream_ms": 593000.79, "msg": {"type": "session_end"}}
+diff --git a/experiments/evidence/v3-18471a8-rt/report.md b/experiments/evidence/v3-18471a8-rt/report.md
+new file mode 100644
+index 0000000..ca18711
+--- /dev/null
++++ b/experiments/evidence/v3-18471a8-rt/report.md
+@@ -0,0 +1,103 @@
++# Turn-taking benchmark report: my-team
++
++> **Labels: script_derived.** Development labels are derived from the scripts of synthetic recordings and are not yet validated by native listeners.
++
++## In plain words
++
++- ✗ HT-D01: the caller finished and you never took the turn.
++- ✗ HT-D02: the caller finished and you never took the turn.
++- ✗ BG-D01: background sound. You stopped, but the caller did not want the floor.
++- ~ GI-D02: a real interruption. You stopped 0.9 s after it was clear (full credit needs 0.3 s).
++- ~ AM-D02: an ambiguous word. You stopped 0.5 s after it was clear (full credit needs 0.3 s).
++- ✓ GI-D01: a real interruption. You stopped 0.3 s after it was clear.
++- ✓ GI-D03: a real interruption. You stopped 0.3 s after it was clear.
++- ✓ BC-D01: a backchannel ("mm-hm", "ايه"). You kept talking, correctly.
++- ✓ BC-D02: a backchannel ("mm-hm", "ايه"). You kept talking, correctly.
++- ✓ BC-D02: a backchannel ("mm-hm", "ايه"). You kept talking, correctly.
++- ✓ BC-D02: a backchannel ("mm-hm", "ايه"). You kept talking, correctly.
++- ✓ BC-D03: a backchannel ("mm-hm", "ايه"). You kept talking, correctly.
++- ✓ HT-D03: a hesitation. You kept talking, correctly.
++- ✓ BG-D02: background sound. You kept talking, correctly.
++- ✓ BG-D02: background sound. You kept talking, correctly.
++- ✓ BG-D03: background sound. You kept talking, correctly.
++- ✓ NV-D01: a cough, laugh or echo. You kept talking, correctly.
++- ✓ NV-D02: a cough, laugh or echo. You kept talking, correctly.
++- ✓ NV-D03: a cough, laugh or echo. You kept talking, correctly.
++- ✓ AM-D01: an ambiguous word; either choice is acceptable here, you kept talking.
++- ✓ AM-D03: an ambiguous word; either choice is acceptable here, you stopped.
++- ✓ OV-D01: both starting at once. You stopped 0.0 s after it was clear.
++- ✓ OV-D02: both starting at once. You kept talking, correctly.
++- ✓ OV-D03: both starting at once. You stopped 0.0 s after it was clear.
++- ✓ DV-D01: a dialect case. You kept talking, correctly.
++- ✓ DV-D02: a dialect case. You kept talking, correctly.
++- ✓ DV-D03: a dialect case. You stopped 0.3 s after it was clear.
++
++## Headline
++
++| Core score | Responsiveness R | Restraint S | F (harmonic) | Ambiguity A | End-of-turn (separate track) |
++|---|---|---|---|---|---|
++| **96.4** / 100 | 0.95 | 0.97 | 0.96 | 1.00 | not attempted |
++
++- Stop latency after the intent was evident: median 252 ms, p90 871 ms (7 yields)
++- Missed interruptions: 0 of 7 · false stops: 1 (0.14 per minute of agent speech) · hiccups (stop + quick RESUME): 0
++- Network round trip: median 1.07 ms, max 4.61 ms
++- Protocol errors: 0 · decisions outside agent speech (ignored): 0
++
++## By category
++
++| Category | R | S | genuine stops caught | backchannels/noise kept | scenarios with no stray stop |
++|---|---|---|---|---|---|
++| AM Ambiguous | 0.90 | 1.00 | 1/1 | 0/0 | 3/3 |
++| BC Backchannel | – | 1.00 | 0/0 | 5/5 | 3/3 |
++| BG Background | – | 0.75 | 0/0 | 3/4 | 3/3 |
++| DV Dialect variation | 1.00 | 1.00 | 1/1 | 2/2 | 3/3 |
++| GI Genuine interruption | 0.90 | 1.00 | 3/3 | 0/0 | 3/3 |
++| HT Hesitation | – | 1.00 | 0/0 | 1/1 | 3/3 |
++| NV Caller non-speech / echo | – | 1.00 | 0/0 | 3/3 | 3/3 |
++| OV Overlap | 1.00 | 1.00 | 2/2 | 1/1 | 3/3 |
++
++## Slices
++
++| Slice | scenarios | R | S | F |
++|---|---|---|---|---|
++| najdi | 12 | 0.97 | 1.00 | 0.98 |
++| other_dialects | 12 | 0.86 | 0.95 | 0.90 |
++| clean_audio | 13 | 1.00 | 1.00 | 1.00 |
++| noisy_or_phone | 11 | 0.88 | 0.96 | 0.92 |
++| scripted | 24 | 0.95 | 0.97 | 0.96 |
++
++Dialect gap (Najdi F − other F): 0.08 · noise gap (clean F − noisy F): 0.08
++
++## Every event
++
++| Scenario | Event | Category | Expected | Outcome | Credit | What the agent did |
++|---|---|---|---|---|---|---|
++| GI-D01 | GI-D01.e1 | GI | STOP | yield | 1.00 | stopped at 17302 ms (252 ms after evident) |
++| GI-D02 | GI-D02.e1 | GI | STOP | yield | 0.71 | stopped at 16901 ms (871 ms after evident) |
++| GI-D03 | GI-D03.e1 | GI | STOP | yield | 1.00 | stopped at 12942 ms (252 ms after evident) |
++| BC-D01 | BC-D01.e1 | BC | KEEP | kept | 1.00 | kept speaking |
++| BC-D02 | BC-D02.e1 | BC | KEEP | kept | 1.00 | kept speaking |
++| BC-D02 | BC-D02.e2 | BC | KEEP | kept | 1.00 | kept speaking |
++| BC-D02 | BC-D02.e3 | BC | KEEP | kept | 1.00 | kept speaking |
++| BC-D03 | BC-D03.e1 | BC | KEEP | kept | 1.00 | kept speaking |
++| HT-D01 | HT-D01.e1 | HT | TAKE_TURN | eot | 0.00 | no TAKE_TURN after the caller finished |
++| HT-D02 | HT-D02.e1 | HT | TAKE_TURN | eot | 0.00 | no TAKE_TURN after the caller finished |
++| HT-D03 | HT-D03.e1 | HT | KEEP | kept | 1.00 | kept speaking |
++| BG-D01 | BG-D01.e1 | BG | KEEP | false_stop | 0.00 | false stop at 14602 ms |
++| BG-D02 | BG-D02.e1 | BG | KEEP | kept | 1.00 | kept speaking |
++| BG-D02 | BG-D02.e2 | BG | KEEP | kept | 1.00 | kept speaking |
++| BG-D03 | BG-D03.e1 | BG | KEEP | kept | 1.00 | kept speaking |
++| NV-D01 | NV-D01.e1 | NV | KEEP | kept | 1.00 | kept speaking |
++| NV-D02 | NV-D02.e1 | NV | KEEP | kept | 1.00 | kept speaking |
++| NV-D03 | NV-D03.e1 | NV | KEEP | kept | 1.00 | kept speaking |
++| AM-D01 | AM-D01.e1 | AM | EITHER | kept | 1.00 | kept speaking |
++| AM-D02 | AM-D02.e1 | AM | STOP | yield | 0.90 | stopped at 13363 ms (503 ms after evident) |
++| AM-D03 | AM-D03.e1 | AM | EITHER | yield | 1.00 | stopped at 15423 ms |
++| OV-D01 | OV-D01.e1 | OV | STOP | yield | 1.00 | stopped at 11263 ms (23 ms after evident) |
++| OV-D02 | OV-D02.e1 | OV | KEEP | kept | 1.00 | kept speaking |
++| OV-D03 | OV-D03.e1 | OV | STOP | yield | 1.00 | stopped at 12662 ms (22 ms after evident) |
++| DV-D01 | DV-D01.e1 | DV | KEEP | kept | 1.00 | kept speaking |
++| DV-D02 | DV-D02.e1 | DV | KEEP | kept | 1.00 | kept speaking |
++| DV-D03 | DV-D03.e1 | DV | STOP | yield | 1.00 | stopped at 12189 ms (299 ms after evident) |
++
++Scoring rules: SCORING.md. Times are scenario time in ms, measured when your decision reached the harness.
+diff --git a/experiments/evidence/v3-18471a8-rt/run.json b/experiments/evidence/v3-18471a8-rt/run.json
+new file mode 100644
+index 0000000..8afdc7b
+--- /dev/null
++++ b/experiments/evidence/v3-18471a8-rt/run.json
+@@ -0,0 +1,300 @@
++{
++  "harness_version": "0.1.0",
++  "url": "ws://127.0.0.1:48645",
++  "speed": 1.0,
++  "session_id": "dev",
++  "official": true,
++  "frames_planned": 29651,
++  "errors": [],
++  "rtt_ms": [
++    1.39,
++    1.07,
++    0.93,
++    1.07,
++    1.01,
++    1.15,
++    1.28,
++    1.1,
++    1.0,
++    1.05,
++    1.0,
++    0.8,
++    1.03,
++    1.03,
++    1.04,
++    0.88,
++    0.99,
++    0.96,
++    0.77,
++    1.14,
++    0.92,
++    1.1,
++    1.02,
++    1.53,
++    0.91,
++    1.0,
++    4.14,
++    1.14,
++    1.37,
++    1.1,
++    1.09,
++    0.36,
++    1.28,
++    0.73,
++    0.94,
++    0.92,
++    0.99,
++    1.04,
++    0.92,
++    1.16,
++    0.81,
++    0.94,
++    0.93,
++    0.95,
++    1.25,
++    1.0,
++    0.92,
++    1.08,
++    1.0,
++    1.0,
++    1.07,
++    1.17,
++    4.61,
++    1.02,
++    1.08,
++    1.21,
++    1.14,
++    1.4,
++    1.22,
++    1.32,
++    0.95,
++    1.38,
++    0.9,
++    0.98,
++    1.42,
++    1.5,
++    1.17,
++    1.08,
++    1.06,
++    1.22,
++    1.3,
++    1.23,
++    0.9,
++    0.93,
++    1.31,
++    0.89,
++    1.74,
++    1.12,
++    0.93,
++    0.99,
++    1.38,
++    0.88,
++    1.02,
++    1.12,
++    1.08,
++    1.03,
++    1.37,
++    1.42,
++    1.9,
++    2.34,
++    1.55,
++    1.29,
++    1.25,
++    1.25,
++    1.53,
++    1.06,
++    1.05,
++    0.95,
++    1.15,
++    1.2,
++    1.0,
++    1.06,
++    1.05,
++    1.51,
++    0.98,
++    1.07,
++    1.2,
++    1.64,
++    0.94,
++    0.98,
++    1.01,
++    1.36,
++    1.14,
++    1.06,
++    1.0,
++    1.93,
++    1.04,
++    1.19,
++    1.38
++  ],
++  "hello": {
++    "type": "hello",
++    "team": "my-team",
++    "system_version": "3b76ebb-dirty",
++    "tracks": [
++      "core",
++      "eot"
++    ]
++  },
++  "completed": true,
++  "frames_sent": 29651,
++  "max_send_lag_ms": 0.62,
++  "decisions_received": 9,
++  "frame_bytes": 1280,
++  "gap_ms": 1500,
++  "scenarios": [
++    {
++      "scenario_id": "GI-D01",
++      "opaque_id": "GI-D01",
++      "start_ms": 0,
++      "duration_ms": 26860
++    },
++    {
++      "scenario_id": "GI-D02",
++      "opaque_id": "GI-D02",
++      "start_ms": 28360,
++      "duration_ms": 25700
++    },
++    {
++      "scenario_id": "GI-D03",
++      "opaque_id": "GI-D03",
++      "start_ms": 55560,
++      "duration_ms": 24800
++    },
++    {
++      "scenario_id": "BC-D01",
++      "opaque_id": "BC-D01",
++      "start_ms": 81860,
++      "duration_ms": 23640
++    },
++    {
++      "scenario_id": "BC-D02",
++      "opaque_id": "BC-D02",
++      "start_ms": 107000,
++      "duration_ms": 30240
++    },
++    {
++      "scenario_id": "BC-D03",
++      "opaque_id": "BC-D03",
++      "start_ms": 138740,
++      "duration_ms": 25460
++    },
++    {
++      "scenario_id": "HT-D01",
++      "opaque_id": "HT-D01",
++      "start_ms": 165700,
++      "duration_ms": 24680
++    },
++    {
++      "scenario_id": "HT-D02",
++      "opaque_id": "HT-D02",
++      "start_ms": 191880,
++      "duration_ms": 29900
++    },
++    {
++      "scenario_id": "HT-D03",
++      "opaque_id": "HT-D03",
++      "start_ms": 223280,
++      "duration_ms": 24460
++    },
++    {
++      "scenario_id": "BG-D01",
++      "opaque_id": "BG-D01",
++      "start_ms": 249240,
++      "duration_ms": 21180
++    },
++    {
++      "scenario_id": "BG-D02",
++      "opaque_id": "BG-D02",
++      "start_ms": 271920,
++      "duration_ms": 25860
++    },
++    {
++      "scenario_id": "BG-D03",
++      "opaque_id": "BG-D03",
++      "start_ms": 299280,
++      "duration_ms": 22500
++    },
++    {
++      "scenario_id": "NV-D01",
++      "opaque_id": "NV-D01",
++      "start_ms": 323280,
++      "duration_ms": 19220
++    },
++    {
++      "scenario_id": "NV-D02",
++      "opaque_id": "NV-D02",
++      "start_ms": 344000,
++      "duration_ms": 20000
++    },
++    {
++      "scenario_id": "NV-D03",
++      "opaque_id": "NV-D03",
++      "start_ms": 365500,
++      "duration_ms": 19640
++    },
++    {
++      "scenario_id": "AM-D01",
++      "opaque_id": "AM-D01",
++      "start_ms": 386640,
++      "duration_ms": 22700
++    },
++    {
++      "scenario_id": "AM-D02",
++      "opaque_id": "AM-D02",
++      "start_ms": 410840,
++      "duration_ms": 21280
++    },
++    {
++      "scenario_id": "AM-D03",
++      "opaque_id": "AM-D03",
++      "start_ms": 433620,
++      "duration_ms": 23980
++    },
++    {
++      "scenario_id": "OV-D01",
++      "opaque_id": "OV-D01",
++      "start_ms": 459100,
++      "duration_ms": 21040
++    },
++    {
++      "scenario_id": "OV-D02",
++      "opaque_id": "OV-D02",
++      "start_ms": 481640,
++      "duration_ms": 19460
++    },
++    {
++      "scenario_id": "OV-D03",
++      "opaque_id": "OV-D03",
++      "start_ms": 502600,
++      "duration_ms": 22440
++    },
++    {
++      "scenario_id": "DV-D01",
++      "opaque_id": "DV-D01",
++      "start_ms": 526540,
++      "duration_ms": 19560
++    },
++    {
++      "scenario_id": "DV-D02",
++      "opaque_id": "DV-D02",
++      "start_ms": 547600,
++      "duration_ms": 23060
++    },
++    {
++      "scenario_id": "DV-D03",
++      "opaque_id": "DV-D03",
++      "start_ms": 572160,
++      "duration_ms": 19860
++    }
++  ],
++  "rtt_summary_ms": {
++    "median": 1.07,
++    "max": 4.61,
++    "n": 119
++  },
++  "dataset": {
++    "path": "/tmp/claude-0/-home-user-sarj/9793397b-cc18-5d28-b03a-a99095015bb3/scratchpad/demo/data/dev",
++    "manifest_sha256": "93a23bcd8eddd0c615488ef1089b6d252182eac71144dc2f359ad7ecb5029366"
++  }
++}
+\ No newline at end of file
+diff --git a/experiments/evidence/v3-18471a8-rt/score.json b/experiments/evidence/v3-18471a8-rt/score.json
+new file mode 100644
+index 0000000..b43f013
+--- /dev/null
++++ b/experiments/evidence/v3-18471a8-rt/score.json
+@@ -0,0 +1,681 @@
++{
++  "team": "my-team",
++  "system_version": "3b76ebb-dirty",
++  "official_speed": true,
++  "speed": 1.0,
++  "thresholds": {
++    "T_full_ms": 300,
++    "T_dead_ms": 1500,
++    "E_full_ms": 600,
++    "E_dead_ms": 2000,
++    "E_miss_ms": 3000,
++    "hiccup_ms": 500,
++    "keep_tail_ms": 500,
++    "agent_tail_ms": 200,
++    "anticipate_ms": 300
++  },
++  "label_status": [
++    "script_derived"
++  ],
++  "core": {
++    "R": 0.950875,
++    "S": 0.96875,
++    "F": 0.9597292765514098,
++    "A": 1.0,
++    "core_score": 96.37563488962688
++  },
++  "eot": {
++    "attempted": false,
++    "P": 1.0,
++    "Q": 0.0,
++    "n_events": 2,
++    "eot_score": 0.0
++  },
++  "categories": {
++    "AM": {
++      "R": 0.8987,
++      "S": 1.0,
++      "n_stop": 1,
++      "stop_yielded": 1,
++      "n_keep": 0,
++      "keep_passed": 0,
++      "n_scenarios": 3,
++      "protected_clean": 3
++    },
++    "BC": {
++      "R": null,
++      "S": 1.0,
++      "n_stop": 0,
++      "stop_yielded": 0,
++      "n_keep": 5,
++      "keep_passed": 5,
++      "n_scenarios": 3,
++      "protected_clean": 3
++    },
++    "BG": {
++      "R": null,
++      "S": 0.75,
++      "n_stop": 0,
++      "stop_yielded": 0,
++      "n_keep": 4,
++      "keep_passed": 3,
++      "n_scenarios": 3,
++      "protected_clean": 3
++    },
++    "DV": {
++      "R": 1.0,
++      "S": 1.0,
++      "n_stop": 1,
++      "stop_yielded": 1,
++      "n_keep": 2,
++      "keep_passed": 2,
++      "n_scenarios": 3,
++      "protected_clean": 3
++    },
++    "GI": {
++      "R": 0.9047999999999999,
++      "S": 1.0,
++      "n_stop": 3,
++      "stop_yielded": 3,
++      "n_keep": 0,
++      "keep_passed": 0,
++      "n_scenarios": 3,
++      "protected_clean": 3
++    },
++    "HT": {
++      "R": null,
++      "S": 1.0,
++      "n_stop": 0,
++      "stop_yielded": 0,
++      "n_keep": 1,
++      "keep_passed": 1,
++      "n_scenarios": 3,
++      "protected_clean": 3
++    },
++    "NV": {
++      "R": null,
++      "S": 1.0,
++      "n_stop": 0,
++      "stop_yielded": 0,
++      "n_keep": 3,
++      "keep_passed": 3,
++      "n_scenarios": 3,
++      "protected_clean": 3
++    },
++    "OV": {
++      "R": 1.0,
++      "S": 1.0,
++      "n_stop": 2,
++      "stop_yielded": 2,
++      "n_keep": 1,
++      "keep_passed": 1,
++      "n_scenarios": 3,
++      "protected_clean": 3
++    }
++  },
++  "latency_ms": {
++    "n": 7,
++    "median": 252.1,
++    "p90": 871.2
++  },
++  "rates": {
++    "agent_speech_min": 7.191,
++    "false_stops": 1,
++    "hiccups": 0,
++    "false_stops_per_min": 0.139,
++    "misses": 0,
++    "n_stop_events": 7,
++    "unattributed_decisions": 0,
++    "ignored_decisions": 0
++  },
++  "slices": {
++    "najdi": {
++      "n_scenarios": 12,
++      "R": 0.9662333333333333,
++      "S": 1.0,
++      "F": 0.9828267245325241
++    },
++    "other_dialects": {
++      "n_scenarios": 12,
++      "R": 0.8572,
++      "S": 0.9523809523809524,
++      "F": 0.9022872961906467
++    },
++    "clean_audio": {
++      "n_scenarios": 13,
++      "R": 1.0,
++      "S": 1.0,
++      "F": 1.0
++    },
++    "noisy_or_phone": {
++      "n_scenarios": 11,
++      "R": 0.87795,
++      "S": 0.9642857142857143,
++      "F": 0.9190948110409325
++    },
++    "scripted": {
++      "n_scenarios": 24,
++      "R": 0.950875,
++      "S": 0.96875,
++      "F": 0.9597292765514098
++    },
++    "naturalistic": null,
++    "dialect_gap": 0.08053942834187733,
++    "noise_gap": 0.08090518895906751
++  },
++  "rtt_ms": {
++    "median": 1.07,
++    "max": 4.61,
++    "n": 119
++  },
++  "protocol_errors": 0,
++  "events": [
++    {
++      "event_id": "GI-D01.e1",
++      "category": "GI",
++      "expected": "STOP",
++      "kind": "interruption",
++      "onset_ms": 16630,
++      "outcome": "yield",
++      "latency_ms": 251.8,
++      "credit": 1.0,
++      "detail": "stopped at 17302 ms (252 ms after evident)",
++      "scenario_id": "GI-D01"
++    },
++    {
++      "event_id": "GI-D02.e1",
++      "category": "GI",
++      "expected": "STOP",
++      "kind": "interruption",
++      "onset_ms": 14100,
++      "outcome": "yield",
++      "latency_ms": 871.2,
++      "credit": 0.7144,
++      "detail": "stopped at 16901 ms (871 ms after evident)",
++      "scenario_id": "GI-D02"
++    },
++    {
++      "event_id": "GI-D03.e1",
++      "category": "GI",
++      "expected": "STOP",
++      "kind": "interruption",
++      "onset_ms": 12240,
++      "outcome": "yield",
++      "latency_ms": 252.1,
++      "credit": 1.0,
++      "detail": "stopped at 12942 ms (252 ms after evident)",
++      "scenario_id": "GI-D03"
++    },
++    {
++      "event_id": "BC-D01.e1",
++      "category": "BC",
++      "expected": "KEEP",
++      "kind": "interruption",
++      "onset_ms": 12400,
++      "outcome": "kept",
++      "credit": 1.0,
++      "detail": "kept speaking",
++      "scenario_id": "BC-D01"
++    },
++    {
++      "event_id": "BC-D02.e1",
++      "category": "BC",
++      "expected": "KEEP",
++      "kind": "interruption",
++      "onset_ms": 13430,
++      "outcome": "kept",
++      "credit": 1.0,
++      "detail": "kept speaking",
++      "scenario_id": "BC-D02"
++    },
++    {
++      "event_id": "BC-D02.e2",
++      "category": "BC",
++      "expected": "KEEP",
++      "kind": "interruption",
++      "onset_ms": 17920,
++      "outcome": "kept",
++      "credit": 1.0,
++      "detail": "kept speaking",
++      "scenario_id": "BC-D02"
++    },
++    {
++      "event_id": "BC-D02.e3",
++      "category": "BC",
++      "expected": "KEEP",
++      "kind": "interruption",
++      "onset_ms": 22070,
++      "outcome": "kept",
++      "credit": 1.0,
++      "detail": "kept speaking",
++      "scenario_id": "BC-D02"
++    },
++    {
++      "event_id": "BC-D03.e1",
++      "category": "BC",
++      "expected": "KEEP",
++      "kind": "interruption",
++      "onset_ms": 15550,
++      "outcome": "kept",
++      "credit": 1.0,
++      "detail": "kept speaking",
++      "scenario_id": "BC-D03"
++    },
++    {
++      "event_id": "HT-D01.e1",
++      "category": "HT",
++      "expected": "TAKE_TURN",
++      "kind": "end_of_turn",
++      "onset_ms": 13640,
++      "outcome": "eot",
++      "patience_items": [
++        {
++          "item": "pause 14480-15380",
++          "passed": true
++        },
++        {
++          "item": "while the caller speaks",
++          "passed": true
++        }
++      ],
++      "latency_ms": null,
++      "credit": 0.0,
++      "detail": "no TAKE_TURN after the caller finished",
++      "scenario_id": "HT-D01"
++    },
++    {
++      "event_id": "HT-D02.e1",
++      "category": "HT",
++      "expected": "TAKE_TURN",
++      "kind": "end_of_turn",
++      "onset_ms": 11760,
++      "outcome": "eot",
++      "patience_items": [
++        {
++          "item": "pause 14830-17030",
++          "passed": true
++        },
++        {
++          "item": "pause 20080-21180",
++          "passed": true
++        },
++        {
++          "item": "pause 23840-24740",
++          "passed": true
++        },
++        {
++          "item": "while the caller speaks",
++          "passed": true
++        }
++      ],
++      "latency_ms": null,
++      "credit": 0.0,
++      "detail": "no TAKE_TURN after the caller finished",
++      "scenario_id": "HT-D02"
++    },
++    {
++      "event_id": "HT-D03.e1",
++      "category": "HT",
++      "expected": "KEEP",
++      "kind": "interruption",
++      "onset_ms": 13790,
++      "outcome": "kept",
++      "credit": 1.0,
++      "detail": "kept speaking",
++      "scenario_id": "HT-D03"
++    },
++    {
++      "event_id": "BG-D01.e1",
++      "category": "BG",
++      "expected": "KEEP",
++      "kind": "interruption",
++      "onset_ms": 6750,
++      "outcome": "false_stop",
++      "credit": 0.0,
++      "detail": "false stop at 14602 ms",
++      "scenario_id": "BG-D01"
++    },
++    {
++      "event_id": "BG-D02.e1",
++      "category": "BG",
++      "expected": "KEEP",
++      "kind": "interruption",
++      "onset_ms": 11280,
++      "outcome": "kept",
++      "credit": 1.0,
++      "detail": "kept speaking",
++      "scenario_id": "BG-D02"
++    },
++    {
++      "event_id": "BG-D02.e2",
++      "category": "BG",
++      "expected": "KEEP",
++      "kind": "interruption",
++      "onset_ms": 14880,
++      "outcome": "kept",
++      "credit": 1.0,
++      "detail": "kept speaking",
++      "scenario_id": "BG-D02"
++    },
++    {
++      "event_id": "BG-D03.e1",
++      "category": "BG",
++      "expected": "KEEP",
++      "kind": "interruption",
++      "onset_ms": 11360,
++      "outcome": "kept",
++      "credit": 1.0,
++      "detail": "kept speaking",
++      "scenario_id": "BG-D03"
++    },
++    {
++      "event_id": "NV-D01.e1",
++      "category": "NV",
++      "expected": "KEEP",
++      "kind": "interruption",
++      "onset_ms": 11440,
++      "outcome": "kept",
++      "credit": 1.0,
++      "detail": "kept speaking",
++      "scenario_id": "NV-D01"
++    },
++    {
++      "event_id": "NV-D02.e1",
++      "category": "NV",
++      "expected": "KEEP",
++      "kind": "interruption",
++      "onset_ms": 12000,
++      "outcome": "kept",
++      "credit": 1.0,
++      "detail": "kept speaking",
++      "scenario_id": "NV-D02"
++    },
++    {
++      "event_id": "NV-D03.e1",
++      "category": "NV",
++      "expected": "KEEP",
++      "kind": "interruption",
++      "onset_ms": 5880,
++      "outcome": "kept",
++      "credit": 1.0,
++      "detail": "kept speaking",
++      "scenario_id": "NV-D03"
++    },
++    {
++      "event_id": "AM-D01.e1",
++      "category": "AM",
++      "expected": "EITHER",
++      "kind": "interruption",
++      "onset_ms": 13940,
++      "outcome": "kept",
++      "behaviour": "KEEP",
++      "credit": 1.0,
++      "detail": "kept speaking",
++      "scenario_id": "AM-D01"
++    },
++    {
++      "event_id": "AM-D02.e1",
++      "category": "AM",
++      "expected": "STOP",
++      "kind": "interruption",
++      "onset_ms": 11730,
++      "outcome": "yield",
++      "latency_ms": 502.7,
++      "credit": 0.8987,
++      "detail": "stopped at 13363 ms (503 ms after evident)",
++      "scenario_id": "AM-D02"
++    },
++    {
++      "event_id": "AM-D03.e1",
++      "category": "AM",
++      "expected": "EITHER",
++      "kind": "interruption",
++      "onset_ms": 14690,
++      "outcome": "yield",
++      "behaviour": "STOP",
++      "latency_ms": 0.0,
++      "credit": 1.0,
++      "detail": "stopped at 15423 ms",
++      "scenario_id": "AM-D03"
++    },
++    {
++      "event_id": "OV-D01.e1",
++      "category": "OV",
++      "expected": "STOP",
++      "kind": "interruption",
++      "onset_ms": 10300,
++      "outcome": "yield",
++      "latency_ms": 23.3,
++      "credit": 1.0,
++      "detail": "stopped at 11263 ms (23 ms after evident)",
++      "scenario_id": "OV-D01"
++    },
++    {
++      "event_id": "OV-D02.e1",
++      "category": "OV",
++      "expected": "KEEP",
++      "kind": "interruption",
++      "onset_ms": 10720,
++      "outcome": "kept",
++      "credit": 1.0,
++      "detail": "kept speaking",
++      "scenario_id": "OV-D02"
++    },
++    {
++      "event_id": "OV-D03.e1",
++      "category": "OV",
++      "expected": "STOP",
++      "kind": "interruption",
++      "onset_ms": 12240,
++      "outcome": "yield",
++      "latency_ms": 21.6,
++      "credit": 1.0,
++      "detail": "stopped at 12662 ms (22 ms after evident)",
++      "scenario_id": "OV-D03"
++    },
++    {
++      "event_id": "DV-D01.e1",
++      "category": "DV",
++      "expected": "KEEP",
++      "kind": "interruption",
++      "onset_ms": 9220,
++      "outcome": "kept",
++      "credit": 1.0,
++      "detail": "kept speaking",
++      "scenario_id": "DV-D01"
++    },
++    {
++      "event_id": "DV-D02.e1",
++      "category": "DV",
++      "expected": "KEEP",
++      "kind": "interruption",
++      "onset_ms": 13430,
++      "outcome": "kept",
++      "credit": 1.0,
++      "detail": "kept speaking",
++      "scenario_id": "DV-D02"
++    },
++    {
++      "event_id": "DV-D03.e1",
++      "category": "DV",
++      "expected": "STOP",
++      "kind": "interruption",
++      "onset_ms": 11170,
++      "outcome": "yield",
++      "latency_ms": 298.8,
++      "credit": 1.0,
++      "detail": "stopped at 12189 ms (299 ms after evident)",
++      "scenario_id": "DV-D03"
++    }
++  ],
++  "scenarios": [
++    {
++      "scenario_id": "GI-D01",
++      "category": "GI",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "GI-D02",
++      "category": "GI",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "GI-D03",
++      "category": "GI",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "BC-D01",
++      "category": "BC",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "BC-D02",
++      "category": "BC",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "BC-D03",
++      "category": "BC",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "HT-D01",
++      "category": "HT",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "HT-D02",
++      "category": "HT",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "HT-D03",
++      "category": "HT",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "BG-D01",
++      "category": "BG",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "BG-D02",
++      "category": "BG",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "BG-D03",
++      "category": "BG",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "NV-D01",
++      "category": "NV",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "NV-D02",
++      "category": "NV",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "NV-D03",
++      "category": "NV",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "AM-D01",
++      "category": "AM",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "AM-D02",
++      "category": "AM",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "AM-D03",
++      "category": "AM",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "OV-D01",
++      "category": "OV",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "OV-D02",
++      "category": "OV",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "OV-D03",
++      "category": "OV",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "DV-D01",
++      "category": "DV",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "DV-D02",
++      "category": "DV",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    },
++    {
++      "scenario_id": "DV-D03",
++      "category": "DV",
++      "credit": 1.0,
++      "spurious_stops": [],
++      "spurious_weight": 0
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/render.yaml b/render.yaml
+index f0d36be..cf69133 100644
+--- a/render.yaml
++++ b/render.yaml
+@@ -12,4 +12,4 @@ services:
+     autoDeploy: true
+     envVars:
+       - key: SARJ_DEMO_MAX_SESSIONS
+-        value: "12"
++        value: "12"   # = 4 simultaneous playbacks x 3 detectors; measured peak 408 MB with 3 playbacks (512 MB plan)
+diff --git a/tests/test_demo.py b/tests/test_demo.py
+index 9c74571..f610434 100644
+--- a/tests/test_demo.py
++++ b/tests/test_demo.py
+@@ -91,17 +91,30 @@ def dev_app():
+     return demo.DemoApp(DEV, demo.DEFAULT_MODELS)
+ 
+ 
+-def test_exactly_two_pinned_detectors(dev_app):
+-    """Baseline and P3 only, each the exact file of its recorded run (experiments/evidence/runs.json)."""
+-    assert list(dev_app.models) == ["p3", "baseline"]
++def test_exactly_three_pinned_detectors(dev_app):
++    """Baseline, P3 and SARJ v3, each the exact files of its recorded run (experiments/evidence/runs.json)."""
++    assert list(dev_app.models) == ["p3", "v3", "baseline"]
+     runs = json.loads((KIT / "experiments" / "evidence" / "runs.json").read_text(encoding="utf-8"))["runs"]
+-    p3, base = dev_app.models["p3"], dev_app.models["baseline"]
+-    assert p3.available and base.available, (p3.error, base.error)
++    p3, base, v3 = dev_app.models["p3"], dev_app.models["baseline"], dev_app.models["v3"]
++    assert p3.available and base.available and v3.available, (p3.error, base.error, v3.error)
+     assert p3.sha256 == runs["p3-6b4eece-rt"]["my_system_sha256"] == demo.P3_SHA256
+     assert base.sha256 == runs["baseline-bd2a3f0-rt"]["my_system_sha256"] == demo.BASELINE_SHA256
++    assert v3.sha256 == runs["v3-18471a8-rt"]["my_system_sha256"] == demo.V3_SHA256
++    assert runs["v3-18471a8-rt"]["files_pinned"] == demo.V3_FILES
+     assert (p3.name, p3.revision, base.name, base.revision) == ("P3 Hybrid", "b32cfc2", "Baseline", "bd2a3f0")
++    assert (v3.name, v3.revision) == ("SARJ v3", "18471a8")
+     assert p3.new_system().vad is not None                   # P3 really runs the neural VAD ...
+     assert not hasattr(base.new_system(), "vad")             # ... and Baseline is the plain loudness rule
++    assert hasattr(v3.new_system(), "dec")                   # ... and v3 is the tt/ decider
++
++
++def test_v3_refuses_a_changed_module(tmp_path, monkeypatch):
++    """A multi-file detector is pinned file by file: editing any tt/ module disables it instead of running it."""
++    spec = dict(demo.DEFAULT_MODELS["v3"])
++    rel = next(iter(spec["files"]))
++    spec["files"] = {**spec["files"], rel: "0" * 64}
++    m = demo.Model("v3", spec)
++    assert not m.available and "not the pinned" in m.error
+ 
+ 
+ def test_p3_files_are_the_audited_phase3_files():
+@@ -214,13 +227,13 @@ def test_api_real_stop_and_real_keep(dev_app):
+ 
+ 
+ def test_config_reports_recorded_benchmarks_not_live_scores(dev_app):
+-    """Exactly the two recorded dev-set rows, equal to experiments/evidence/runs.json; no other version anywhere."""
++    """Exactly the three recorded dev-set rows, equal to experiments/evidence/runs.json; no other version anywhere."""
+     cfg = dev_app.config()
+     assert len(cfg["scenarios"]) == 24
+     rows = {r["model"]: r for r in cfg["benchmark"]["rows"]}
+-    assert set(rows) == {"baseline", "p3"}
++    assert set(rows) == {"baseline", "p3", "v3"}
+     runs = json.loads((KIT / "experiments" / "evidence" / "runs.json").read_text(encoding="utf-8"))["runs"]
+-    for model, run in (("baseline", "baseline-bd2a3f0-rt"), ("p3", "p3-6b4eece-rt")):
++    for model, run in (("baseline", "baseline-bd2a3f0-rt"), ("p3", "p3-6b4eece-rt"), ("v3", "v3-18471a8-rt")):
+         r = runs[run]
+         assert rows[model]["core"] == round(r["core"], 2) and rows[model]["R"] == round(r["R"], 3)
+         assert rows[model]["S"] == round(r["S"], 3)
+diff --git a/tests/test_demo_public.py b/tests/test_demo_public.py
+index a8bf0f1..028b4d6 100644
+--- a/tests/test_demo_public.py
++++ b/tests/test_demo_public.py
+@@ -179,13 +179,13 @@ def test_pinned_baseline_is_the_recorded_baseline_file():
+ 
+ # ------------------------------------------------------------------------------------------------ exposure
+ @needs_audio
+-def test_public_config_offers_two_detectors_and_hides_internals(app):
++def test_public_config_offers_three_detectors_and_hides_internals(app):
+     cfg = app.config()
+     assert cfg["mode"] == "public"
+-    assert [m["id"] for m in cfg["models"]] == ["p3", "baseline"]
++    assert [m["id"] for m in cfg["models"]] == ["p3", "v3", "baseline"]
+     for m in cfg["models"]:
+         assert set(m) == {"id", "name", "revision", "about", "dirty", "available"} and m["available"]
+-    assert {r["model"] for r in cfg["benchmark"]["rows"]} == {"baseline", "p3"}
++    assert {r["model"] for r in cfg["benchmark"]["rows"]} == {"baseline", "p3", "v3"}
+     text = json.dumps(cfg, ensure_ascii=False)
+     for secret in (str(KIT), "data/dev", "sha256", "GI-D51", "-H5", "E01b", "e566234", "runs.json\": {"):
+         assert secret not in text, secret
+-- 
+2.43.0
+
