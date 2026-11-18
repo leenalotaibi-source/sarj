@@ -38,6 +38,23 @@ Plateau, not a peak: Core stays 84–92 for caller-level percentile 70–90 and 
 - v2 waits ~520 ms and longer for softer speech or speech at agent phrase ends: backchannels pass, but isolated one-word commands in xdev ("توقف", 0.5 s) are missed.
 - In xdev, a single "نعم" is KEEP and a single "توقف" is STOP. No acoustic cue separates them, so this needs the words layer (keyword spotting).
 
+## Words layer: is it worth it? (oracle upper bound)
+
+`tt/words.py` adds streaming ASR on the caller run, with an Arabic lexicon:
+- **stop:** لا، لحظة، توقف، بس، اسمع، إلغاء… → STOP at once.
+- **keep:** نعم، إيه، أيوه، أها، تمام… → wait 800 ms longer.
+
+To size the gain before choosing a model, `tools/kit_eval.py --oracle-words D` feeds a *perfect* transcript from the labels, each word released only after it has been spoken plus a delay of D ms. This is **analysis only**: labels are never used by the system.
+
+| ASR delay D | dev | xdev |
+|---|---|---|
+| no words | 92.2 | 68.5 |
+| 300 ms | 98.3 | 88.2 |
+| 600 ms | 96.1 | 82.5 |
+| 1000 ms | 93.4 | 70.9 |
+
+The gain depends on latency, not just accuracy: a model must return in ≲ 500 ms on the laptop CPU. Candidate: faster-whisper base/tiny, int8 (MIT). This still has to be measured with the real model; Whisper on 0.5–1 s clips may also hallucinate.
+
 ## Failure cases (≥ 5, with Arabic examples)
 1. **GI-D03 "لحظة."** (car noise): one 450 ms word right at an agent phrase end, and the caller then goes silent. Acoustically it looks like a backchannel. Fix: words layer (ASR + stop lexicon: لحظة، لا، بس، اسمع).
 2. **BG-D03 "يُمّه! وين الشاحن؟"** (failed in v1, passes in v2): the caller talks to someone in the room. v2 keeps talking only because this side talk is softer than the caller's own turn. A caller who shouts at the room would still trigger a stop. Real fix: words (addressee).

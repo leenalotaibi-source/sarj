@@ -1,0 +1,149 @@
+"""Words layer: what the caller SAID, from streaming ASR, as a STOP / KEEP cue.
+
+Acoustics cannot tell a one-word command ("توقف", "لا") from a one-word
+acknowledgement ("نعم", "أها"): same length, same level. The words can.
+
+    lexicon   classify(text) -> "stop" | "keep" | "content" | None
+    worker    WordsWorker: runs an ASR backend off the audio thread; results
+              carry the request id so stale ones (old run/utterance) are dropped
+    backends  FasterWhisperBackend (offline CPU, MIT), or any object with
+              transcribe(int16 audio @16 kHz) -> str
+
+Nothing here blocks on_frame. In offline evaluation (`sync=True`) the backend
+runs inline and its result is released only after `latency_ms` of stream
+time, so replay scores include the ASR delay.
+"""
+from __future__ import annotations
+
+import queue
+import re
+import threading
+import time
+from typing import Optional
+
+import numpy as np
+
+# ------------------------------------------------------------------ lexicon
+_DIACRITICS = re.compile(r"[ؐ-ًؚ-ٰٟۖ-ۭـ]")
+_NON_LETTER = re.compile(r"[^ء-يa-z0-9 ]+")
+
+
+def normalize(text: str) -> str:
+    t = _DIACRITICS.sub("", text.lower())
+    t = re.sub("[إأآٱ]", "ا", t)
+    t = t.replace("ى", "ي").replace("ة", "ه").replace("ؤ", "و").replace("ئ", "ي")
+    t = _NON_LETTER.sub(" ", t)
+    t = re.sub(r"(.)\1{2,}", r"\1\1", t)          # "اممممم" -> "امم"
+    return " ".join(t.split())
+
+
+# Words that claim the floor: objection, stop, wait, correction (Gulf/Najdi/Hijazi + MSA)
+STOP_WORDS = {
+    "لا", "لاء", "لالا", "توقف", "وقف", "قف", "اوقف", "لحظه", "لحظة", "دقيقه", "ثانيه", "استنى", "استني", "انتظر",
+    "اصبر", "بس", "اسمع", "اسمعني", "اسمعيني", "الغ", "الغي", "الغاء", "كنسل", "سوري", "عفوا", "مو", "مب", "ماابي",
+    "مابي", "ماابغى", "مابغى", "غلط", "خطا", "ثواني", "يكفي", "خلاص", "stop", "no", "wait", "cancel",
+}
+# Listener tokens: acknowledge and hand the floor back
+KEEP_WORDS = {
+    "نعم", "ايه", "ايوه", "اي", "اها", "اه", "هيه", "هيه", "ام", "امم", "مم", "ممم", "تمام", "صح", "طيب", "موافق",
+    "اوكي", "اوك", "زين", "حلو", "ماشي", "اكيد", "يب", "يس", "اهاا", "معك", "معاك", "معايا", "فاهم", "فاهمه",
+    "مزبوط", "صحيح", "الله", "يعطيك", "العافيه", "تفضل", "تفضلي", "هلا", "ok", "yes", "yeah", "mhm",
+}
+# Multi-word stop phrases (checked on the normalised string)
+STOP_PHRASES = ("ما ابي", "ما ابغى", "مو كذا", "مب كذا", "ثانيه بس", "خلني اقول", "بقول لك", "عندي سوال")
+
+
+def classify(text: str) -> Optional[str]:
+    """'stop' if any floor-claiming word, 'keep' if only listener tokens,
+    'content' for other speech (>= 2 words), None if nothing usable."""
+    t = normalize(text)
+    if not t:
+        return None
+    if any(p in t for p in STOP_PHRASES):
+        return "stop"
+    toks = t.split()
+    if any(w in STOP_WORDS for w in toks):
+        return "stop"
+    other = [w for w in toks if w not in KEEP_WORDS]
+    if not other:
+        return "keep"
+    return "content" if len(other) >= 2 else None
+
+
+# ------------------------------------------------------------------ backends
+class FasterWhisperBackend:
+    """Offline Whisper on CPU via CTranslate2 (pip install faster-whisper).
+    model_dir: a local CTranslate2 Whisper model (e.g. faster-whisper-base)."""
+
+    def __init__(self, model_dir: str, threads: int = 2):
+        from faster_whisper import WhisperModel  # optional dependency
+        self.model = WhisperModel(model_dir, device="cpu", compute_type="int8", cpu_threads=threads)
+        self.transcribe(np.zeros(16000, dtype=np.int16))  # warm-up before the call starts
+
+    def transcribe(self, audio: np.ndarray, **_ctx) -> str:
+        x = audio.astype(np.float32) / 32768.0
+        segs, _ = self.model.transcribe(
+            x, language="ar", beam_size=1, best_of=1, temperature=0.0, condition_on_previous_text=False,
+            without_timestamps=True, vad_filter=False, no_speech_threshold=0.6,
+            initial_prompt="لا، لحظة، بس، توقف، نعم، إيه، أيوه، تمام")
+        return " ".join(s.text for s in segs if s.no_speech_prob < 0.6).strip()
+
+
+# ------------------------------------------------------------------ worker
+class WordsWorker:
+    """One request in flight at a time; newest result wins.
+
+    submit(req_id, audio, now_ms) -> bool (False if busy)
+    poll(now_ms) -> (req_id, text) or None
+    """
+
+    def __init__(self, backend, sync: bool = False, latency_ms: Optional[float] = None):
+        self.backend = backend
+        self.sync = sync
+        self.latency_ms = latency_ms      # sync mode: fixed simulated delay (None = measured compute time)
+        self._busy = False
+        self._ready = []                  # (release_ms, req_id, text)
+        self._lock = threading.Lock()
+        if not sync:
+            self._q: "queue.Queue" = queue.Queue(maxsize=1)
+            threading.Thread(target=self._loop, daemon=True).start()
+
+    @property
+    def busy(self) -> bool:
+        return self._busy
+
+    def submit(self, req_id, audio: np.ndarray, now_ms: float, **ctx) -> bool:
+        if self._busy:
+            return False
+        self._busy = True
+        if self.sync:
+            t0 = time.perf_counter()
+            try:
+                text = self.backend.transcribe(audio, now_ms=now_ms, **ctx)
+            except Exception:
+                text = ""
+            dt = (time.perf_counter() - t0) * 1000 if self.latency_ms is None else self.latency_ms
+            self._ready.append((now_ms + dt, req_id, text))
+        else:
+            self._q.put((req_id, audio))
+        return True
+
+    def _loop(self):
+        while True:
+            req_id, audio = self._q.get()
+            try:
+                text = self.backend.transcribe(audio)
+            except Exception:
+                text = ""
+            with self._lock:
+                self._ready.append((0.0, req_id, text))
+
+    def poll(self, now_ms: float):
+        with self._lock:
+            due = [r for r in self._ready if r[0] <= now_ms]
+            if not due:
+                return None
+            self._ready = [r for r in self._ready if r[0] > now_ms]
+        self._busy = False
+        _, req_id, text = due[-1]
+        return req_id, text

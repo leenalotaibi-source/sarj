@@ -14,6 +14,7 @@ from typing import List, Optional
 from .config import Config
 from .frontend import Frontend, FrameFeatures
 from .prefix import LinearModel, prefix_vector
+from .words import classify
 
 STOP, RESUME = "STOP", "RESUME"
 _PUNCT_END = re.compile(r"[.!?؟،,؛;:…]$")
@@ -98,8 +99,13 @@ def parse_agent_info(*args, **kwargs) -> AgentPlan:
 
 
 class Decider:
-    def __init__(self, cfg: Optional[Config] = None):
+    def __init__(self, cfg: Optional[Config] = None, words=None):
         self.cfg = cfg or Config()
+        self.words = words          # WordsWorker (tt/words.py) or None
+        self.audio = collections.deque(maxlen=int(self.cfg.asr_window_ms // self.cfg.frame_ms) + 20)
+        self.utt_seq = 0
+        self.run_seq = 0
+        self.last_submit = -1e9
         self.fe = Frontend(self.cfg)
         self.caller_ref_db = None   # caller's own speaking level (near-field)
         self._ref_levels = collections.deque(maxlen=500)
@@ -134,6 +140,8 @@ class Decider:
         self.run_frames = []
         self.run_ctx = (False, False, False, 0.0)
         self.clf_adjust = 0.0
+        self.word_verdict = None
+        self.word_text = ""
 
     def agent_start(self, *args, **kwargs):
         self.agent_on = True
@@ -141,6 +149,7 @@ class Decider:
             self.plan = parse_agent_info(*args, **kwargs)
         except Exception:
             self.plan = AgentPlan()
+        self.utt_seq += 1
         self._reset_utt()
 
     def agent_end(self, *args, **kwargs):
@@ -154,6 +163,9 @@ class Decider:
         self.t += cfg.frame_ms
         t = self.t
         self.abs_t += cfg.frame_ms
+        if self.words is not None:
+            self.audio.append((self.abs_t, np.asarray(caller, dtype=np.int16).copy()))
+            self._poll_words()
 
         if not self.agent_on:
             # the caller is the main speaker now: learn their near-field level
@@ -184,6 +196,9 @@ class Decider:
                 self.run_ctx = self.context(t)
                 self.clf_adjust = 0.0
                 self.run_start_abs = self.abs_t
+                self.run_seq += 1
+                self.word_verdict = None
+                self.word_text = ""
             self.run_speech += cfg.frame_ms
             self.run_levels.append(f.excess_db)
             self.run_flux.append(f.flux)
@@ -220,7 +235,22 @@ class Decider:
                 return RESUME
             return None
 
-        if run_ended or self.run_start is None:
+        if self.run_start is None:
+            return None
+
+        # ---- words layer ----
+        if self.words is not None:
+            if self.word_verdict == "stop" and self.run_speech >= cfg.word_stop_min_ms:
+                # a floor-claiming word ("لا", "لحظة", "توقف"): stop now, even
+                # if the caller already fell silent while ASR was working
+                self.stopped = True
+                self.stop_t = t
+                self._log(t, STOP, f, words=self.word_text)
+                return STOP
+            if not run_ended:
+                self._submit_words()
+
+        if run_ended:
             return None
 
         need = self._needed_ms(f)
@@ -232,6 +262,31 @@ class Decider:
         return None
 
     # -------------------------------------------------------------- helpers
+    def _submit_words(self):
+        cfg = self.cfg
+        if (self.run_speech < cfg.asr_min_speech_ms or self.words.busy
+                or self.abs_t - self.last_submit < cfg.asr_every_ms):
+            return
+        t0 = self.run_start_abs - cfg.asr_pre_ms
+        frames = [a for (ts, a) in self.audio if ts > t0]
+        if not frames:
+            return
+        req = (id(self), self.utt_seq, self.run_seq)
+        if self.words.submit(req, np.concatenate(frames), self.abs_t,
+                             t0_ms=max(t0, self.abs_t - cfg.asr_window_ms), t1_ms=self.abs_t):
+            self.last_submit = self.abs_t
+
+    def _poll_words(self):
+        res = self.words.poll(self.abs_t)
+        if res is None:
+            return
+        req, text = res
+        if req != (id(self), self.utt_seq, self.run_seq):
+            return  # stale: an earlier run, utterance or call
+        v = classify(text)
+        if v is not None and not (self.word_verdict == "stop" and v != "stop"):
+            self.word_verdict, self.word_text = v, text
+
     def context(self, t: float):
         """(agent_pause, near_phrase_end, after_question, t_in_utt_ms) at time t."""
         return ((t - self.last_agent_voice_t) > 150,
@@ -275,6 +330,10 @@ class Decider:
         if self._in_zone(start, self.plan.question_ends_ms, cfg.question_zone_ms):
             need -= cfg.question_shorten_ms
         need += self.clf_adjust
+        if self.word_verdict == "keep":
+            need += cfg.keep_word_extra_ms      # only listener tokens so far (نعم، أها، تمام)
+        elif self.word_verdict == "content":
+            need -= cfg.content_word_shorten_ms
         return max(need, 160.0)
 
     @staticmethod

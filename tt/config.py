@@ -53,6 +53,17 @@ class Config:
     clf_path: str = "models/bc_clf.json"
     clf_gain_ms: float = 200.0           # p=1 -> stop 200 ms sooner, p=0 -> 200 ms later
 
+    # ---- words layer (tt/words.py) ----
+    use_words: bool = False
+    asr_model_dir: str = "models/faster-whisper-base"
+    asr_min_speech_ms: float = 160.0     # transcribe once a run has this much speech
+    asr_every_ms: float = 200.0          # re-transcribe the growing run this often
+    asr_pre_ms: float = 200.0            # audio kept before the run start
+    asr_window_ms: float = 3000.0        # at most this much audio per request
+    word_stop_min_ms: float = 100.0      # a stop word needs at least this much speech
+    keep_word_extra_ms: float = 800.0    # only listener tokens heard -> wait this much longer
+    content_word_shorten_ms: float = 0.0
+
     # ---- soft stop + RESUME ----
     soft_stop: bool = False              # stop EARLY (soft_stop_after_ms), rely on RESUME
     soft_stop_after_ms: float = 300.0

@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from tt.config import Config  # noqa: E402
 from tt.decider import Decider  # noqa: E402
+from tt.words import FasterWhisperBackend, WordsWorker  # noqa: E402
 
 try:  # the kit provides the base class and the WebSocket runner
     from ttbench.server import System, run  # type: ignore
@@ -44,15 +45,29 @@ def _config_from_env() -> Config:
 class MySystem(System):
     def __init__(self):
         self.cfg = _config_from_env()
-        self.dec = Decider(self.cfg)
+        self.words = self._load_words()      # loaded once, before the first call
+        self.dec = Decider(self.cfg, words=self.words)
         self.debug = bool(os.environ.get("TT_DEBUG"))
         self._slow = 0
 
     # ------------------------------------------------------------- callbacks
+    def _load_words(self):
+        """Offline ASR for the words layer; None (acoustics only) if unavailable."""
+        if not self.cfg.use_words:
+            return None
+        path = self.cfg.asr_model_dir
+        if not os.path.isabs(path):
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+        try:
+            return WordsWorker(FasterWhisperBackend(path))
+        except Exception:
+            self._err()
+            return None
+
     def on_scenario_start(self, context=None):
         """New call: fresh echo/noise/caller-level state (one connection serves many calls)."""
         try:
-            self.dec = Decider(self.cfg)
+            self.dec = Decider(self.cfg, words=self.words)
         except Exception:
             self._err()
 

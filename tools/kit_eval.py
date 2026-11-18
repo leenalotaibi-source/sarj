@@ -30,18 +30,51 @@ from ttbench.harness import FRAME_MS, FRAME_SAMPLES, build_stream  # noqa: E402
 from ttbench.score import load_labels, score  # noqa: E402
 
 import my_system  # noqa: E402
+from tt.words import WordsWorker  # noqa: E402
 
 
-def run_once(scenarios, labels, manifest, cfg_spec: str = ""):
+class OracleASR:
+    """UPPER-BOUND EXPERIMENT ONLY. Reads the caller transcript from the labels
+    (never available at inference) and reveals each word only once it has
+    been fully spoken (time spread by character count). Shows how much a
+    perfect streaming ASR with a given delay could add; not a system result.
+    Background/TV speech is not in user_segments, so this is optimistic."""
+
+    def __init__(self):
+        self.label = None
+
+    def transcribe(self, audio, now_ms=0.0, t0_ms=0.0, t1_ms=0.0, **_):
+        out = []
+        for seg in (self.label or {}).get("user_segments", []):
+            text = seg.get("text") or ""
+            if not text or seg["end_ms"] <= t0_ms or seg["start_ms"] >= t1_ms:
+                continue
+            words = text.split()
+            total = sum(len(w) for w in words) or 1
+            acc = 0
+            for w in words:
+                acc += len(w)
+                if seg["start_ms"] + (seg["end_ms"] - seg["start_ms"]) * acc / total <= t1_ms:
+                    out.append(w)
+        return " ".join(out)
+
+
+def run_once(scenarios, labels, manifest, cfg_spec: str = "", oracle_ms=None):
     os.environ["TT_CFG"] = cfg_spec
     stream, controls = build_stream(scenarios)
     sysm = my_system.MySystem()
+    oracle = None
+    if oracle_ms is not None:
+        oracle = OracleASR()
+        sysm.words = WordsWorker(oracle, sync=True, latency_ms=oracle_ms)
     log = []
     n = len(stream) // FRAME_SAMPLES
     for i in range(n):
         for m in controls.get(i, []):
             t = m["type"]
             if t == "scenario_start":
+                if oracle is not None:
+                    oracle.label = labels[m["scenario_id"]]
                 sysm.on_scenario_start(m.get("context", {}))
             elif t == "agent_utterance_start":
                 sysm.on_agent_start(m.get("text", ""), m.get("duration_ms", 0))
@@ -71,6 +104,8 @@ def main():
     ap.add_argument("--sweep", action="append", default=[], help="key=v1,v2,...")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--out", default="")
+    ap.add_argument("--oracle-words", type=float, default=None, metavar="LATENCY_MS",
+                    help="UPPER BOUND: perfect ASR from the labels with this delay (analysis only)")
     args = ap.parse_args()
     only = [c for c in args.calls.split(",") if c] or None
     labels, manifest = load_labels(Path(args.data))
@@ -84,7 +119,7 @@ def main():
     best = None
     for g in grid:
         spec = ",".join(filter(None, [base] + g))
-        res, log = run_once(scen, labels, manifest, spec)
+        res, log = run_once(scen, labels, manifest, spec, args.oracle_words)
         line = f"{spec or '(defaults)':60s} {summary(res)}"
         print(line, flush=True)
         if best is None or res["core"]["core_score"] > best[0]:
