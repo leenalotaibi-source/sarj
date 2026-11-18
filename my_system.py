@@ -46,6 +46,9 @@ class MySystem(System):
     def __init__(self):
         self.cfg = _config_from_env()
         self.words = self._load_words()      # loaded once, before the first call
+        # one line for dashboards / the demo page: which layers are really running
+        self.demo_note = ("acoustics + words (Whisper tiny, offline)" if self.words is not None
+                          else "acoustics only (words layer off or ASR model missing)")
         self.dec = Decider(self.cfg, words=self.words)
         self.debug = bool(os.environ.get("TT_DEBUG"))
         self._slow = 0
