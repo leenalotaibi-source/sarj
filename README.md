@@ -1,5 +1,7 @@
 # Sarj hackathon: human-like turn taking (Arabic phone calls)
 
+**v5, official real-time run on the 24 dev calls: Core 97.4 (R 0.973, S 0.969), end-of-turn 90.9, 0 protocol errors.**
+
 While the agent speaks, decide every 20 ms: keep talking, `STOP`, or (optionally) `RESUME`.
 
 ## Layout
@@ -9,11 +11,19 @@ my_system.py              kit entry point (thin, never raises); all logic in tt/
 tt/config.py              every tunable parameter (override with TT_CFG="k=v,k=v")
 tt/frontend.py            per-frame features: echo suppression, noise floor, voicing, optional Silero VAD
 tt/decider.py             run tracking + STOP/RESUME rules + agent-text cues
+tt/words.py               words layer: offline Whisper tiny (transcript + keyword spotting) + Arabic lexicon
+tt/eot.py                 end of turn (agent silent): pause, hesitation, words, digit count -> TAKE_TURN
 tt/prefix.py              prefix features of a caller speech run + JSON logistic model
 tools/augment.py          phone band / mu-law / echo / noise / far-field augmentation
 tools/make_synth_calls.py build labelled stereo calls from clip folders
 tools/replay.py           offline replay + APPROXIMATE score on our own synthetic calls
 tools/train_classifier.py backchannel-vs-interruption classifier from labelled calls
+tools/kit_eval.py         offline run of the 24 dev calls with the OFFICIAL scorer
+tools/robustness.py       the same calls with the caller line degraded (gain, phone, noise, babble)
+tools/site_data.py        refresh the demo page's per-call data from a real run
+tools/build_site.py       embed tt/ + site/py/ + site/results.json into site/index.html
+site/index.html           demo page: runs tt/ in the browser (Pyodide); no API keys in the source
+site/worker.js            optional Cloudflare proxy that holds the Gemini key for the page
 tests/smoke.sh            end-to-end plumbing test on fake audio (no kit/data needed)
 models/silero_vad.onnx    Silero VAD v5 (MIT), only used with use_silero=1
 ```
@@ -40,7 +50,13 @@ TT_CFG="stop_after_ms=450,soft_stop=1" python -m ttbench.play --fast   # paramet
 TT_DEBUG=1 python -m ttbench.play --fast               # log every decision + slow frames
 python -m ttbench.summary runs/<name>
 
-bash tests/smoke.sh                                    # plumbing test, no data needed
+bash tools/kit_eval.py         offline run of the 24 dev calls with the OFFICIAL scorer
+tools/robustness.py       the same calls with the caller line degraded (gain, phone, noise, babble)
+tools/site_data.py        refresh the demo page's per-call data from a real run
+tools/build_site.py       embed tt/ + site/py/ + site/results.json into site/index.html
+site/index.html           demo page: runs tt/ in the browser (Pyodide); no API keys in the source
+site/worker.js            optional Cloudflare proxy that holds the Gemini key for the page
+tests/smoke.sh                                    # plumbing test, no data needed
 python tools/make_synth_calls.py --clips clips --out synth_out --n 200
 python tools/replay.py synth_out --fails 10
 python tools/train_classifier.py synth_out             # -> models/bc_clf.json, then use_clf=1

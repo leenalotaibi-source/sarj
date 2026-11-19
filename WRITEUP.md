@@ -12,7 +12,9 @@
 | Whisper tiny (OpenAI), CTranslate2 conversion `Systran/faster-whisper-tiny` | words layer: caller ASR (optional, `use_words=1`) | optional | MIT |
 | faster-whisper + CTranslate2 | Whisper inference on CPU, int8 | optional | MIT |
 
-No internet access is needed at runtime.
+| Pyodide 0.26 (MPL-2.0), Google Gemini (optional, own key) | demo page only: Python in the browser; agent replies, voice and live transcription | demo only | – |
+
+No internet access is needed at runtime. The demo page (`site/`) is not part of the submitted system.
 
 ## Key design findings (dev set, offline replay with the official scorer)
 
@@ -99,10 +101,34 @@ If the best stop word beats the best listener word by ≥ 0.3 (mean log-probabil
 - **Closed-set trap:** a word missing from the candidate list is matched to its nearest candidate. "طيب" (AM-D01) was scored as "توقف" until "طيب" and "تمام" were added as listener candidates. Common listener words must be in the list.
 - **Holdout:** 87.1 → 85.3. Responsiveness rose (0.919 → 0.944), but one background-speech event became a false stop. Not tuned further on holdout.
 
+## v5: end of turn (own leaderboard)
+
+While the agent is silent, `tt/eot.py` decides when the caller has finished (`TAKE_TURN`). It never touches the STOP path.
+
+- Base rule: answer after **700 ms** of quiet (full promptness credit lasts 600 ms after the turn end).
+- **Hesitation** (acoustics): the last sound was a hum (little spectral change) or a syllable held on one pitch → wait 2 s.
+- **Words** (same Whisper tiny, one request per pause, longer transcript, no keyword spotting):
+  - ends on a connector or filler («و»، «يعني»، «بس»، «امم») → wait 1.6 s;
+  - asked the agent to wait («لحظة أشوف») → wait 3 s;
+  - reading out digits → wait, **unless** the caller has read as many digits as the agent asked for: «هو سبع أرقام» in the agent's text → 7 → answer after 450 ms.
+- Without words: each comeback after a long pause adds 250 ms of patience (max 1 s).
+
+**Words only ever add patience** (except the digit count). Whisper tiny writes «بعد المغرب يعني تقريباً الساعة سبع» as «بحدا مغرب! يأني! تقليبنس!»: good enough to spot «يعني» or «لحظة», not to decide that an answer "sounds finished".
+
+| System | End-of-turn (dev, 2 events, 5 required pauses) |
+|---|---|
+| Kit baseline (700 ms of quiet) | 28.5 |
+| TurnSense v3.1 (team page, offline) | 78.8 |
+| v5, acoustics only (`use_words=0`) | 64.7 |
+| **v5, real time** | **90.9** (P 0.83, Q 1.00) |
+
+Core in the same real-time run: **97.4** (R 0.973, S 0.969), 1 false stop, 0 misses, 0 protocol errors (`experiments/v5-rt/`). Two events are far too few to tune on: the thresholds are round numbers chosen from the scoring rule, not from these calls.
+
 ## Failure cases (≥ 5, with Arabic examples)
 1. **GI-D03 "لحظة."** (car noise): one 450 ms word right at an agent phrase end, and the caller then goes silent. Acoustically it looks like a backchannel. Fix: words layer (ASR + stop lexicon: لحظة، لا، بس، اسمع).
 2. **BG-D03 "يُمّه! وين الشاحن؟"** (failed in v1, passes in v2): the caller talks to someone in the room. v2 keeps talking only because this side talk is softer than the caller's own turn. A caller who shouts at the room would still trigger a stop. Real fix: words (addressee).
 3. **OV-D02 "الوطنية، أيوه، معايا."** (failed in v1, passes in v2 by level only): a 2.4 s multi-word backchannel. Duration alone fires. A robust fix is a lexicon of acknowledgement phrases.
 4. **GI-D02 "أيوه… … بس أبغى أغيّر الموعد"**: the intent is only evident at "بس". We stop late (≈0.9 s), because "أيوه" + pauses look like a backchannel.
 5. **BG-D01 (TV speech)** during the agent's *first* utterance: the caller has not spoken yet, so there is no caller level to compare against and the TV can trigger a stop.
-6. **Risk:** a caller who interrupts *softly* (tired, polite) is penalised by the level rule. The synthetic stress test with random interruption levels shows a big responsiveness drop.
+6. **HT-D02 «ثلاثة، سبعة، تسعة … واحد، اثنين …»** (end of turn): we took the turn once at 19.5 s, in a gap inside the dictation that is not labelled as a pause. The digit count then held us correctly until the seventh digit. Fix: count digit groups acoustically too, so we do not depend on the recogniser hearing every digit.
+7. **Risk:** a caller who interrupts *softly* (tired, polite) is penalised by the level rule. The synthetic stress test with random interruption levels shows a big responsiveness drop.
