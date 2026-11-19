@@ -95,6 +95,8 @@ def classify(text: str) -> Optional[str]:
 
 
 # ------------------------------------------------------------------ backends
+EOT_MAX_TOKENS = 40   # end-of-turn requests read the whole answer (digits, connectors at the end)
+
 class FasterWhisperBackend:
     """Offline Whisper on CPU via CTranslate2 (pip install faster-whisper).
     model_dir: a local CTranslate2 Whisper model (e.g. faster-whisper-base)."""
@@ -104,14 +106,15 @@ class FasterWhisperBackend:
         self.model = WhisperModel(model_dir, device="cpu", compute_type="int8", cpu_threads=threads)
         self.transcribe(np.zeros(16000, dtype=np.int16))  # warm-up before the call starts
 
-    def transcribe(self, audio: np.ndarray, **_ctx) -> str:
+    def transcribe(self, audio: np.ndarray, mode: str = "stop", **_ctx) -> str:
         x = audio.astype(np.float32) / 32768.0
         # no initial_prompt: Whisper copies prompt words into the output on
         # short clips (a "stop" word out of thin air). Short output cap: the
         # cues are in the first few words, and it stops repetition loops.
         segs, _ = self.model.transcribe(
             x, language="ar", beam_size=1, best_of=1, temperature=0.0, condition_on_previous_text=False,
-            without_timestamps=True, vad_filter=False, no_speech_threshold=0.6, max_new_tokens=12)
+            without_timestamps=True, vad_filter=False, no_speech_threshold=0.6,
+            max_new_tokens=EOT_MAX_TOKENS if mode == "eot" else 12)
         return " ".join(s.text for s in segs if s.no_speech_prob < 0.6).strip()
 
 
@@ -152,19 +155,26 @@ class WhisperKWSBackend:
         self.last_scores: dict = {}
         self.transcribe(np.zeros(16000, dtype=np.int16))  # warm-up before the call starts
 
-    def transcribe(self, audio: np.ndarray, **_ctx) -> str:
+    def transcribe(self, audio: np.ndarray, mode: str = "stop", **_ctx) -> str:
+        """mode="stop": barge-in check (12 tokens + keyword spotting).
+        mode="eot": the end of the caller's answer, for end-of-turn (longer
+        transcript, no keyword spotting: a stop word means nothing there)."""
         x = audio.astype(np.float32) / 32768.0
         f = self.model.feature_extractor(x)[:, -self.window:]       # newest audio if longer than the window
         n = f.shape[-1]
         f = np.pad(f, ((0, 0), (0, self.window - n)))
         enc = np.array(self.model.encode(f))
         ct2 = self._ct2
+        eot = mode == "eot"
         g = self.model.model.generate(ct2.StorageView.from_array(enc), [self.start], beam_size=1,
-                                      max_length=len(self.start) + 12, return_no_speech_prob=True)[0]
+                                      max_length=len(self.start) + (EOT_MAX_TOKENS if eot else 12),
+                                      return_no_speech_prob=True, repetition_penalty=1.2 if eot else 1.0)[0]
         if g.no_speech_prob > self.no_speech:
             self.last_scores = {}
             return ""
         text = self.tok.decode([t for t in g.sequences_ids[0] if t < self.tok.eot]).strip()
+        if eot:
+            return text
         res = self.model.model.align(ct2.StorageView.from_array(np.repeat(enc, len(self.cands), axis=0)),
                                      self.start, self.cand_tokens, n)
         sc = [float(np.mean(np.log(np.asarray(r.text_token_probs[:len(t)]) + 1e-9)))
@@ -198,11 +208,11 @@ def _serve(q: "queue.Queue", backend, ready: list, lock: threading.Lock, owner: 
     thread ends shortly after its owner (one call / one demo session) is gone."""
     while owner() is not None:
         try:
-            req_id, audio = q.get(timeout=2.0)
+            req_id, audio, ctx = q.get(timeout=2.0)
         except queue.Empty:
             continue
         try:
-            text = backend.transcribe(audio)
+            text = backend.transcribe(audio, **ctx)
         except Exception:
             text = ""
         with lock:
@@ -245,7 +255,7 @@ class WordsWorker:
             dt = (time.perf_counter() - t0) * 1000 if self.latency_ms is None else self.latency_ms
             self._ready.append((now_ms + dt, req_id, text))
         else:
-            self._q.put((req_id, audio))
+            self._q.put((req_id, audio, {k: v for k, v in ctx.items() if k == "mode"}))
         return True
 
     def poll(self, now_ms: float):

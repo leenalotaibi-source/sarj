@@ -28,7 +28,7 @@ def to_float(x) -> np.ndarray:
 
 class FrameFeatures:
     __slots__ = ("caller_db", "agent_db", "excess_db", "snr_db", "voicing",
-                 "vad_prob", "echo_frac", "is_speech", "flux")
+                 "vad_prob", "echo_frac", "is_speech", "flux", "pitch_hz")
 
     def __repr__(self):
         return ("FF(snr=%.1f exc=%.1f ag=%.1f voi=%.2f vad=%s echo=%.2f sp=%s)" %
@@ -137,6 +137,7 @@ class Frontend:
         seg = np.concatenate([self.prev_caller, x])
         seg = seg - seg.mean()
         e = float(np.dot(seg, seg))
+        self.last_pitch = 0.0
         if e < 1e-9:
             return 0.0
         m = len(seg)
@@ -146,7 +147,9 @@ class Frontend:
         hi = min(hi, m - 1)
         # normalise by overlap length so long lags are not penalised
         norm = ac[lo:hi] / (ac[0] + EPS) * (m / (m - np.arange(lo, hi)))
-        return float(np.clip(norm.max(), 0.0, 1.0))
+        k = int(np.argmax(norm))
+        self.last_pitch = float(self.sr / (lo + k))   # used by the end-of-turn layer (tt/eot.py)
+        return float(np.clip(norm[k], 0.0, 1.0))
 
     def _update_lag(self):
         if len(self.env_a) < 100:
@@ -230,6 +233,7 @@ class Frontend:
         f.excess_db = 10 * math.log10(ex_sum + FLOOR)
         f.snr_db = 10 * math.log10((ex_sum + EPS) / self.noise.sum())
         f.voicing = self._voicing(c)
+        f.pitch_hz = self.last_pitch
         f.echo_frac = echo_frac
         # spectral change vs previous frame (articulation: consonants, vowel
         # changes). Level-normalised log spectrum, only bands above noise.

@@ -68,6 +68,23 @@ class Config:
     keep_word_min_run_ms: float = 800.0  # only listener tokens heard -> the run must last this long
     content_word_shorten_ms: float = 0.0
 
+    # ---- end of turn (tt/eot.py): only while the agent is silent, own leaderboard ----
+    eot: bool = True
+    eot_min_turn_ms: float = 300.0       # caller speech needed before a pause can be an end of turn
+    eot_bg_db: float = 12.0              # frames this far below the caller's own level are not the caller
+    eot_quiet_ms: float = 700.0          # default pause before TAKE_TURN
+    eot_done_ms: float = 450.0           # ... when the caller read out all the digits the agent asked for
+    eot_hesitation_ms: float = 2000.0    # ... after «اممم…» or a held syllable
+    eot_wait_ms: float = 1600.0          # ... when the words end on a connector / filler / unfinished digits
+    eot_wait_long_ms: float = 3000.0     # ... when the caller asked the agent to wait («لحظة أشوف»)
+    eot_comeback_pause_ms: float = 500.0 # caller resumed after a pause this long ...
+    eot_patience_step_ms: float = 250.0  # ... -> this much more patience for the rest of the turn
+    eot_patience_max_ms: float = 1000.0
+    eot_hum_flux: float = 2.0            # mean spectral change below this over 200 ms = a hum
+    eot_held_ms: float = 260.0           # final syllable held this long ...
+    eot_held_spread: float = 0.07        # ... within +-7 % pitch = still thinking
+    eot_words_window_ms: float = 10000.0  # audio of the turn sent to the recogniser at each pause
+
     # ---- soft stop + RESUME ----
     soft_stop: bool = False              # stop EARLY (soft_stop_after_ms), rely on RESUME
     soft_stop_after_ms: float = 300.0

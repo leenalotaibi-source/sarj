@@ -1,0 +1,36 @@
+{
+ "realtime": null,
+ "history": [
+  {"v": "Kit baseline", "what": "stops at any sound in the caller channel", "core": 41.0, "R": 0.806, "S": 0.219, "eot": 28.5},
+  {"v": "TurnSense v3.1 (previous page)", "what": "echo removal + caller enrolment + weighted evidence (offline score)", "core": 90.2, "R": 0.859, "S": 0.925, "eot": 78.8},
+  {"v": "v2 acoustic", "what": "graded 'softer than the caller' rule, leaky speech, agent-text context", "core": 92.4, "R": 0.87, "S": 0.97, "eot": null},
+  {"v": "v4 words", "what": "+ offline Whisper tiny: transcript + keyword spotting of stop / listener words", "core": 97.4, "R": null, "S": null, "eot": null},
+  {"v": "v5 (this page)", "what": "+ end of turn: pause, hesitation, words (wait / digits)", "core": null, "R": null, "S": null, "eot": null, "best": true}
+ ],
+ "history_note": "",
+ "robust": [],
+ "robust_note": "",
+ "generalise": [
+  ["Team P3 (Silero VAD + caller-relative, 200 ms)", 73.4, 95.8, 82.0, false],
+  ["v2 acoustic", 92.2, 68.5, 85.4, false],
+  ["v4 / v5 (same STOP path)", 97.5, 87.0, 85.3, true]
+ ],
+ "asr": [
+  ["None (acoustics only)", "–", 92.2],
+  ["Perfect words (upper bound)", "300 ms", 98.3],
+  ["Perfect words (upper bound)", "600 ms", 96.1],
+  ["Perfect words (upper bound)", "1000 ms", 93.4],
+  ["Whisper base, transcript", "500–700 ms", 92.2],
+  ["Whisper tiny, transcript", "~330 ms", 96.2],
+  ["Whisper tiny, transcript + keyword spotting, 10 s window", "~190 ms", 97.5]
+ ],
+ "failures": [
+  {"id": "BG-D01", "kind": "STOP", "status": "still fails", "said": "(TV speech in the room)", "what": "The TV talks during the agent's very first sentence. The caller has not spoken yet, so there is no caller level to compare against, and the TV is loud enough to look like the caller.", "fix": "learn the background talker before the first stop is allowed (it is present before the agent starts), or ask the words whether the speech is addressed to the agent."},
+  {"id": "GI-D02", "kind": "EITHER", "status": "late (0.9 s)", "said": "أيوه… … بس أبغى أغيّر الموعد", "what": "It starts with a listener word and pauses, exactly like a backchannel. The intent only appears at «بس», so we stop 890 ms after it became evident (credit 0.70).", "fix": "a word-order rule: «listener word + بس / لكن» is a turn claim. It needs words within ~300 ms, so a faster recogniser."},
+  {"id": "GI-D03", "kind": "KEEP", "status": "fixed by words", "said": "لحظة.", "what": "One 450 ms word in car noise, right at an agent phrase end, then silence. Acoustically it is a backchannel, and v2 missed it.", "fix": "done in v4: when the caller falls silent we transcribe the complete short word once, and keyword spotting confirms «لحظة»."},
+  {"id": "xdev «توقف»", "kind": "EITHER", "status": "6 of 18 missed", "said": "توقف", "what": "Isolated one-word commands. Free transcription writes «توقف» as «تبقص». Keyword spotting catches 12 of 18 isolated stop words (transcript alone: 8), with 0 of 32 listener words mistaken for a stop.", "fix": "a larger recogniser that is still fast enough (≤ 300 ms), or a small keyword model trained on Saudi commands."},
+  {"id": "BG-D03 / BG-D53", "kind": "KEEP", "status": "fixed by level", "said": "يُمّه! وين الشاحن؟ · «بس» from the TV", "what": "The caller talks to someone in the room, or a background voice says a stop word. Both are 7–10 dB softer than the caller's own turn, so neither the length rule nor the stop word fires.", "fix": "a caller who shouts at the room would still cause a stop: knowing who the words are addressed to needs language understanding."},
+  {"id": "Holdout", "kind": "STOP", "status": "1 new false stop", "said": "(background speech)", "what": "Keyword spotting raised responsiveness on the frozen holdout (0.919 → 0.944) but turned one background-speech event into a false stop: Core 87.1 → 85.3. We kept it, because dev and xdev improved and we did not tune on the holdout.", "fix": "require the stop word's audio to come from the caller's level range, frame by frame, not only on average."},
+  {"id": "HT-D02", "kind": "EITHER", "status": "end of turn: 1 early answer", "said": "ثلاثة، سبعة، تسعة … واحد، اثنين …", "what": "During dictation we took the turn once in a gap that was not labelled as a pause. The digit counting (the agent asked for seven digits) then held us until all seven were read, and we answered 560 ms after the last one.", "fix": "count digit groups acoustically as well, so the end-of-turn layer does not depend on the recogniser hearing every digit."}
+ ]
+}

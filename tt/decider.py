@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from .config import Config
+from .eot import EndOfTurn
 from .frontend import Frontend, FrameFeatures
 from .prefix import LinearModel, prefix_vector
 from .words import classify
@@ -102,7 +103,12 @@ class Decider:
     def __init__(self, cfg: Optional[Config] = None, words=None):
         self.cfg = cfg or Config()
         self.words = words          # WordsWorker (tt/words.py) or None
-        self.audio = collections.deque(maxlen=int(self.cfg.asr_window_ms // self.cfg.frame_ms) + 20)
+        core_frames = int(self.cfg.asr_window_ms // self.cfg.frame_ms) + 20
+        self.core_audio_ms = core_frames * self.cfg.frame_ms     # barge-in requests: at most this much audio
+        self.audio = collections.deque(maxlen=max(core_frames, int(self.cfg.eot_words_window_ms // self.cfg.frame_ms)))
+        self.eot = EndOfTurn(self.cfg)
+        self.eot_seq = 0
+        self.eot_asked = -1
         self.utt_seq = 0
         self.run_seq = 0
         self.last_submit = -1e9
@@ -156,6 +162,9 @@ class Decider:
     def agent_end(self, *args, **kwargs):
         self.agent_on = False
         self.stopped = False
+        self.eot_seq += 1
+        self.eot_asked = -1
+        self.eot.agent_ended(self.plan.text)
 
     # ------------------------------------------------------------ main loop
     def frame(self, agent, caller) -> Optional[str]:
@@ -176,7 +185,14 @@ class Decider:
                 self._ref_levels.append(f.excess_db)
                 if len(self._ref_levels) >= 10:
                     self.caller_ref_db = float(np.percentile(self._ref_levels, cfg.caller_ref_pct))
-            return None
+            if not cfg.eot:
+                return None
+            d = self.eot.frame(f, self.abs_t, self.caller_ref_db)
+            if self.words is not None and d is None:
+                self._submit_eot_words()
+            if d:
+                self._log(t, d, f, need=self.eot.need_ms(), words=self.eot.words)
+            return d
 
         if f.agent_db > -50:
             self.last_agent_voice_t = t
@@ -282,6 +298,7 @@ class Decider:
                                               or self.abs_t - self.last_submit < cfg.asr_every_ms)):
             return False
         t0 = self.run_start_abs - cfg.asr_pre_ms
+        t0 = max(t0, self.abs_t - self.core_audio_ms)
         frames = [a for (ts, a) in self.audio if ts > t0]
         if not frames:
             return False
@@ -292,11 +309,28 @@ class Decider:
             return True
         return False
 
+    def _submit_eot_words(self):
+        """Once per caller pause: transcribe the turn so far for the end-of-turn layer."""
+        e = self.eot
+        if e.sent or e.quiet_ms <= 0 or e.pause_no == self.eot_asked or e.turn_start_abs is None:
+            return
+        if e.quiet_ms > 400 or self.words.busy:     # too late to matter for this pause / recogniser busy
+            return
+        t0 = max(e.turn_start_abs - self.cfg.asr_pre_ms, self.abs_t - self.cfg.eot_words_window_ms)
+        frames = [a for (ts, a) in self.audio if ts > t0]
+        if frames and self.words.submit(("eot", id(self), self.eot_seq, e.pause_no), np.concatenate(frames),
+                                        self.abs_t, t0_ms=t0, t1_ms=self.abs_t, mode="eot"):
+            self.eot_asked = e.pause_no
+
     def _poll_words(self):
         res = self.words.poll(self.abs_t)
         if res is None:
             return
         req, text = res
+        if req and req[0] == "eot":
+            if req[1:3] == (id(self), self.eot_seq):
+                self.eot.set_words(req[3], text)
+            return
         if req != (id(self), self.utt_seq, self.run_seq):
             return  # stale: an earlier run, utterance or call
         v = classify(text)

@@ -98,7 +98,9 @@ def summary(res) -> str:
     c = res["core"]
     cats = " ".join(f"{k}:{'-' if v['R'] is None else f'{v[chr(82)]:.2f}'}/{v['S']:.2f}"
                     for k, v in sorted(res["categories"].items()))
-    return f"Core={c['core_score']:.1f} R={c['R']:.3f} S={c['S']:.3f} | R/S {cats}"
+    e = res.get("eot", {})
+    return (f"Core={c['core_score']:.1f} R={c['R']:.3f} S={c['S']:.3f} EOT={e.get('eot_score', 0):.1f} "
+            f"| R/S {cats}")
 
 
 def main():
