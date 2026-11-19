@@ -124,6 +124,21 @@ While the agent is silent, `tt/eot.py` decides when the caller has finished (`TA
 
 Core in the same real-time run: **97.4** (R 0.973, S 0.969), 1 false stop, 0 misses, 0 protocol errors (`experiments/v5-rt/`). Two events are far too few to tune on: the thresholds are round numbers chosen from the scoring rule, not from these calls.
 
+## Robustness (`tools/robustness.py`, offline, caller line degraded)
+
+| Condition | Baseline | v5 |
+|---|---|---|
+| As is | 41.0 | 96.5 |
+| 6 dB quieter | 52.0 | 94.7 |
+| 6 dB louder | 34.0 | 91.7 |
+| Narrowband phone | 47.8 | 89.8 |
+| Noise, SNR 20 dB | 6.2 | 95.5 |
+| Noise, SNR 10 dB | 0.0 | 83.6 |
+| Babble, 15 dB | 0.0 | 52.6 |
+| Phone + quieter + noise 20 dB | 44.0 | 92.5 |
+
+Gain changes barely matter (every level is relative to the caller). **Babble is the weak spot**: other voices at a caller-like level pass the level rule (S 0.33). Fix: a speaker embedding of the caller from the greeting.
+
 ## Failure cases (≥ 5, with Arabic examples)
 1. **GI-D03 "لحظة."** (car noise): one 450 ms word right at an agent phrase end, and the caller then goes silent. Acoustically it looks like a backchannel. Fix: words layer (ASR + stop lexicon: لحظة، لا، بس، اسمع).
 2. **BG-D03 "يُمّه! وين الشاحن؟"** (failed in v1, passes in v2): the caller talks to someone in the room. v2 keeps talking only because this side talk is softer than the caller's own turn. A caller who shouts at the room would still trigger a stop. Real fix: words (addressee).

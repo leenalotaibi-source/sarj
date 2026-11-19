@@ -53,8 +53,49 @@
   }
  ],
  "history_note": "v2, v4 and v5: official real-time runs (python -m ttbench.play --calls all), decisions timed when they arrive, speech recogniser delay included. Baseline and TurnSense v3.1: offline with the same scorer (no processing delay), so v3.1 is, if anything, flattered. v5 changes nothing on the STOP path: its gain is the end-of-turn track.",
- "robust": [],
- "robust_note": "",
+ "robust": [
+  [
+   "As is",
+   41.0,
+   96.5
+  ],
+  [
+   "6 dB quieter",
+   52.0,
+   94.7
+  ],
+  [
+   "6 dB louder",
+   34.0,
+   91.7
+  ],
+  [
+   "Narrowband phone",
+   47.8,
+   89.8
+  ],
+  [
+   "Noise, SNR 20 dB",
+   6.2,
+   95.5
+  ],
+  [
+   "Noise, SNR 10 dB",
+   0.0,
+   83.6
+  ],
+  [
+   "Babble, 15 dB",
+   0.0,
+   52.6
+  ],
+  [
+   "Phone + quieter + noise 20 dB",
+   44.0,
+   92.5
+  ]
+ ],
+ "robust_note": "Offline, official scorer, words layer on; the agent channel stays clean. Level changes barely matter because every decision is relative to the caller's own voice. Our weak spot is babble: three other callers mixed in at 15 dB are speech at a caller-like level, so restraint falls to 0.33 (Core 52.6). The kit baseline scores 0 there.",
  "generalise": [
   [
    "Team P3 (Silero VAD + caller-relative, 200 ms)",
@@ -171,6 +212,14 @@
    "said": "ثلاثة، سبعة، تسعة … واحد، اثنين …",
    "what": "During dictation we took the turn once in a gap that was not labelled as a pause. The digit counting (the agent asked for seven digits) then held us until all seven were read, and we answered 560 ms after the last one.",
    "fix": "count digit groups acoustically as well, so the end-of-turn layer does not depend on the recogniser hearing every digit."
+  },
+  {
+   "id": "Babble (stress test)",
+   "kind": "STOP",
+   "status": "weak: Core 52.6",
+   "said": "(three other voices in the room, 15 dB below the caller)",
+   "what": "Competing voices that are almost as loud as the caller look like the caller to the level rule, and their runs are long enough to stop on. Restraint falls from 0.97 to 0.33.",
+   "fix": "a voice fingerprint of the caller learned from the greeting (speaker embedding), so only the enrolled voice can claim the floor."
   }
  ]
 }
