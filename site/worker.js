@@ -4,7 +4,7 @@
 // Then Settings -> Variables and Secrets -> add a Secret named GEMINI_API_KEY (and ANTHROPIC_API_KEY for "/").
 // Finally put the worker URL in index.html: const AI_PROXY = "https://<name>.<account>.workers.dev";
 
-const ALLOWED_ORIGINS = ["https://reemaothsa.github.io"]; // only your site may use this worker
+const ALLOWED_ORIGINS = ["https://reemaothsa.github.io", "https://leenalotaibi-source.github.io"]; // only your sites may use this worker
 const GEMINI_MODELS = new Set([                            // only what the page asks for
   "gemini-3.8-flash-lite", "gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite",
   "gemini-3.8-flash-lite-tts", "gemini-3.8-flash-tts", "gemini-2.5-flash-preview-tts", "gemini-3.5-transcribe",
