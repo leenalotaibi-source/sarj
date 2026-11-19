@@ -66,7 +66,7 @@ def run(data_dir: Path):
             r = poll(now)
             if r is not None and cur is not None:
                 req, text = r
-                t = round(now - start)
+                t = round(now)            # the decider clock restarts with every call
                 if req and req[0] == "eot":
                     v = words_verdict(text, m.dec.eot.digits_needed) or "no objection"
                     per[cur]["heard"].append([t, text, "eot:" + v])
